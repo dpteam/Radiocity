@@ -1,0 +1,32 @@
+# Build output
+bin/
+obj/
+*.exe
+*.pdb
+*.dll
+
+# Test artefacts
+*.wav
+!docs/**/*.wav
+*.iq
+*.raw
+selftest_out.*
+
+# IDE and editor noise
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.cache
+*.DotSettings.user
+
+# OS noise
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Local captures and scratch files
+captures/
+scratch/
+*.log

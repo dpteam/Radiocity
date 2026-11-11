@@ -1,0 +1,14 @@
+# Text and source: normalise to LF so diffs are clean across Windows and CI.
+* text=auto eol=lf
+
+*.cs    text eol=lf diff=csharp
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
+*.md    text eol=lf
+*.yml   text eol=lf
+*.json  text eol=lf
+
+# Binary assets: never diff them, never let Git mangle them.
+*.ico   binary
+*.png   binary
+*.wav   binary
