@@ -8,8 +8,41 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Planned
 - RSDN-20 and SAQ decoders
-- Stereo FM decoding (pilot tone and 38 kHz subcarrier)
+- RDS: station name, radiotext and clock from the 57 kHz subcarrier
 - Optional password and rate limiting for the web server
+
+## [0.9.0] - 2026-11-12
+
+### Added
+- **FM stereo** (`-stereo`, `web --stereo`) — pilot recovery at 19 kHz, 38 kHz
+  subcarrier, stereo matrix, de-emphasis applied to L and R after the matrix.
+  Measured separation 48–50 dB on a synthetic broadcast.
+- `FmStereoDecoder`, `LinkedAgc`, `RealDecimator`.
+- Stereo through the whole path: the web `/audio` stream declares two channels,
+  the UI decodes interleaved PCM and feeds two Web Audio channels, and the CLI
+  plays interleaved samples.
+- `Receiver.Channels`, so a caller can tell mono from stereo without guessing.
+
+### Changed
+- **FM baseband now covers the channel, not the audio.** Broadcast FM deviates by
+  ±75 kHz, so the chain must not decimate below ~150 kHz before the
+  discriminator; a 48 kHz baseband clipped the deviation and destroyed the
+  signal. Audio is decimated to 48 kHz *after* demodulation, in a separate stage.
+- Mono FM also benefits: the old 12 kHz baseband truncated audio at 6 kHz.
+- `Squelch` takes separate detector and gate rates, because for stereo they
+  differ by the decimation factor.
+
+### Fixed
+- **Stereo subcarrier was derived from the pilot's first power instead of its
+  square.** The subcarrier is at twice the pilot's angle, so the pilot phasor has
+  to be squared: `e^{j(theta+2psi)} = e^{j theta} * (conj(p)/|p|)^2`. Using
+  `conj(p)/|p|` directly works only when the pilot happens to start at phase
+  zero, and otherwise swaps the channels with ~12 dB of leakage — which is
+  exactly what it did, and why the bug survived the first round of tests.
+- Sign of the squared phasor's imaginary part: with `+2*pI*pQ` the decoder locks
+  to `2*theta - 2*psi` and mirrors the sideband.
+- The FM discriminator was not being run at all in stereo mode, so the composite
+  fed to the decoder was silence.
 
 ## [0.8.0] - 2026-11-12
 

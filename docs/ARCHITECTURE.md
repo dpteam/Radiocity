@@ -251,7 +251,6 @@ waterfall runs at about 25 columns per second at 48 kHz and at 192 kHz alike. A
 fixed 2048-point FFT would scroll four times too fast at 192 kHz.
 
 ## Quadrature front end — `src/Web/QuadratureSource.cs`, `src/Dsp/IqImbalance.cs`
-
 A SoftRock-style downconverter mixes a band down to audio and presents it as two
 channels in quadrature. The card then becomes a 192 kHz-wide *complex*
 digitiser, and the receiver sees −96 … +96 kHz around the local oscillator
@@ -288,6 +287,54 @@ transform — the reason it can stay switched on for synthesised I/Q.
 Guards that matter: no correction until 64 samples of statistics have
 accumulated, and none when `E[I²]` or the determinant is near zero. Dividing by
 a vanishing determinant is how a silent channel turns into infinite gain.
+
+## FM stereo — `src/Dsp/FmStereo.cs`
+
+A stereo broadcast sends three things at once:
+
+```
+MPX = M + S*cos(2*pi*38000*t) + P*cos(2*pi*19000*t)
+M   = (L+R)/2      audio, 0-15 kHz
+S   = (L-R)/2      on a suppressed 38 kHz subcarrier
+P                  a 19 kHz pilot, whose only job is a phase reference
+```
+
+So decoding is: low-pass for M, synchronous detection at 38 kHz for S, then
+`L = M+S` and `R = M-S`.
+
+**Why the pilot exists.** Envelope-detecting the sideband gives `|S|` with an
+unknown sign, and an unknown sign swaps L and R at random. The pilot tells the
+receiver which half of the 38 kHz cycle is which.
+
+**No PLL.** Mixing the composite down by the nominal 19 kHz and low-passing to
+about 100 Hz leaves the pilot as a slowly rotating complex number `p`. Its angle
+is the phase error, and the subcarrier needs *twice* that angle:
+
+```
+e^{j(theta + 2*psi)} = e^{j*theta} * (conj(p)/|p|)^2
+```
+
+Squaring is the part that is easy to get wrong. Using `conj(p)/|p|` without the
+square gives `theta + psi` instead of `theta + 2*psi`, which decodes correctly
+only when the pilot happens to start at phase zero and otherwise swaps the
+channels with about 12 dB of leakage. That bug survived a first round of tests
+because the test signal started at phase zero.
+
+The other sign trap: with `p = pI + j*pQ`, `(conj(p))^2 = (pI^2 - pQ^2) -
+j*2*pI*pQ`. A `+` there locks the decoder to `2*theta - 2*psi` and mirrors the
+sideband.
+
+**Baseband width.** The composite reaches 53 kHz, so the chain must deliver at
+least ~106 kHz to the discriminator. This is also why broadcast FM needs the
+quadrature path: with a mono input, mixing down by a low carrier puts the image
+back inside the band and aliases.
+
+**De-emphasis goes after the matrix**, because the transmitter pre-emphasised L
+and R, not the composite. Applying it early would distort the sideband.
+
+**AGC is linked** (`LinkedAgc`): one gain from the louder channel applied to both.
+A mono AGC over interleaved samples would move the stereo image every time one
+side got louder.
 
 ## Performance notes
 

@@ -19,6 +19,7 @@ audio hardware that is already in the machine.
 ```
 AM      : distortion 109.5 dB below tone      (below float32 resolution)
 FM      : residual    62.3 dB below tone
+FM st.  : 48 dB channel separation (1 kHz left, 3 kHz right)
 SSB     : sideband rejection -111.1 dB
 CW      : carrier -> 700 Hz beat note
 clock   : 27.0 ppm injected, 26.92 ppm measured
@@ -97,6 +98,10 @@ bin\Radiocity.exe dcf77 70 192000 -b24 rem decode the 77.5 kHz time signal
 | `dcf77 [sec] [rate]` | Decode the DCF77 time signal at 77.5 kHz |
 | `web [--sim] [--port N]` | Serve the WebSDR UI (waterfall, audio, tuning) |
 | `web --iq` / `web --sim-iq` | Same, fed from a quadrature front end (I/Q on two channels) |
+
+Add `-stereo` for FM stereo, and `-nb` for the impulse noise blanker (`-nb20` for
+a looser threshold). Both are off by default: on a clean signal a blanker can
+only do harm, and stereo needs a 192 kHz capture.
 | `iq record <file> <freqHz> [sec]` | Record baseband I/Q for offline analysis |
 | `iq demod <file> <out.wav> [mode]` | Demodulate a recording — try any mode on the same capture |
 | `iq info <file>` | Show what a recording contains |
@@ -145,6 +150,7 @@ affordable on a 2005 CPU.
 | AM | `src/Dsp/Demod.cs` | Envelope + 20 Hz DC blocker |
 | FM | `src/Dsp/FmDemod.cs` | `atan2` of `z[n]·conj(z[n-1])` — amplitude-independent, so no limiter |
 | SSB/CW | `src/Dsp/SsbDemod.cs` | Phasing method, 127-tap Hilbert, −111 dB rejection |
+| FM stereo | `src/Dsp/FmStereo.cs` | 19 kHz pilot, 38 kHz subcarrier recovered by squaring the pilot phasor, stereo matrix |
 | AGC | `src/Dsp/Demod.cs` | RMS detector, asymmetric *gain slew* (not an asymmetric detector) |
 | Squelch | `src/Dsp/Squelch.cs` | Hysteresis on channel power, measured before the AGC |
 | Blanker | `src/Dsp/NoiseBlanker.cs` | Impulse detection on the baseband, before the channel filter smears the click |
@@ -173,6 +179,7 @@ Full explanation in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | Blanker | 8× less error, tone within 1% | removes the clicks, not the signal |
 | I/Q file | float32 bit-exact, int16 within half an LSB | metadata survives the round trip |
 | Imbalance | image from −31 dB to −80 dB | blind correction must not need a calibration signal |
+| FM stereo | > 30 dB channel separation | below that the stereo image collapses to mono |
 | Resampler | amplitude within 2%, > 30 dB | a bad interpolator is audible as dullness |
 | DCF77 | full frame at −40 and −20 dBFS | the second one is a noisy city, not a lab |
 
@@ -239,16 +246,52 @@ docs/HARDWARE.md             antennas and downconverters, by budget
 Working: capture and playback, AM, FM, USB, LSB, CW, AGC, squelch, impulse
 blanker, spectrum, offline demodulation, clock calibration, DCF77 decoding,
 8/16/24/32-bit capture, multi-stage decimation, I/Q recording, a **WebSDR front
-end**, **independent tuning for every listener**, and a **quadrature front end
-path** with blind I/Q imbalance correction.
+end**, **independent tuning for every listener**, a **quadrature front end path**
+with blind I/Q imbalance correction, and **FM stereo**.
 
 Not yet:
 
 - [ ] RSDN-20 and SAQ decoders.
-- [ ] Stereo FM decoding (the pilot tone and the 38 kHz subcarrier). Mono FM
-      works; stereo needs a subcarrier PLL and a stereo matrix.
+- [ ] RDS (the 57 kHz data subcarrier) — station name, radiotext, clock time.
 - [ ] Password and rate limiting on the web server. It is a receiver for a
       trusted network, not a public service.
+
+## FM stereo
+
+```cmd
+bin\Radiocity.exe web --iq --rate 192000 -stereo
+```
+
+A stereo broadcast does not send left and right. It sends `M = (L+R)/2`, plus
+`S = (L-R)/2` on a suppressed 38 kHz subcarrier, plus a 19 kHz pilot whose only
+job is to say where that subcarrier is. Recovering L and R is: strip the pilot,
+synchronously detect the subcarrier to get S, then `L = M+S`, `R = M-S`.
+
+**Why a quadrature front end is required.** Stereo puts information up to 53 kHz
+into the composite, so the receiver needs at least 106 kHz of baseband. A mono
+sound-card input at 192 kHz has only ±96 kHz of *complex* range after mixing, and
+the mixer image lands back inside the band — wideband FM needs the I/Q path.
+`--rate 192000` plus `--iq` (or `--sim-iq`) is the configuration that works.
+
+**Why the pilot matters.** A plain envelope detector on the 38 kHz sideband gives
+`|S|` with a random sign, which swaps L and R at random. The pilot is the phase
+reference that makes the sign meaningful.
+
+**No PLL.** Mixing the composite down by the nominal 19 kHz and low-passing to
+~100 Hz leaves the pilot as a slowly rotating complex number. Its *square* is the
+subcarrier: `e^{j(theta+2psi)} = e^{j theta} * (conj(p)/|p|)^2`. Getting that
+square wrong is a subtle bug — the channels still decode, but they swap depending
+on the sample offset, which is exactly how it behaved before it was fixed.
+
+Measured on a synthetic broadcast with 1 kHz in L and 3 kHz in R:
+
+```
+L: wanted 0.245, leaked 0.001  separation 48.4 dB
+R: wanted 0.244, leaked 0.001  separation 50.3 dB
+```
+
+AGC is linked across the two channels, because a mono AGC on interleaved L/R
+would move the stereo image every time one side got louder.
 
 ## Quadrature front end
 

@@ -115,7 +115,7 @@ RTL-TCP client would reuse everything else.
 |---|---|---|
 | Bare wire, 192 kHz | 0–96 kHz | DCF77 (maybe), sferics, whistlers |
 | Ferrite rod + cap, 192 kHz | 77.5 kHz | DCF77 reliably, every minute |
-| Downconverter, 192 kHz, `--iq` | ±96 kHz complex around the LO | AM broadcast, SSB amateurs, CW, utilities, **mono broadcast FM** |
+| Downconverter, 192 kHz, `--iq` | ±96 kHz complex around the LO | AM broadcast, SSB amateurs, CW, utilities, **broadcast FM — mono and stereo** |
 | RTL-SDR | 24 MHz–1.7 GHz | everything, but with different software |
 
 ## A reality check on noise
