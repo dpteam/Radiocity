@@ -133,8 +133,3 @@ jobs:
         with:
           files: Radiocity-${{ github.ref_name }}.zip
           generate_release_notes: true
-          body: |
-            Radiocity ${{ github.ref_name }} — a sound card used as an SDR front end.
-
-            Runs on .NET Framework 4.0, so Windows XP SP3 and newer. Any CPU.
-            Unzip anywhere and run `Radiocity.exe selftest` first.

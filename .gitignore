@@ -1,9 +1,11 @@
 # Build output
 bin/
 obj/
+dist/
 *.exe
 *.pdb
 *.dll
+*.zip
 
 # Test artefacts
 *.wav
