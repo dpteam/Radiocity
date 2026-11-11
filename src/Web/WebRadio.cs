@@ -132,7 +132,7 @@ namespace Radiocity.Web
 
                 RadioSession session = new RadioSession(_hub, id, _initialFreq, _initialMode, _initialChannel,
                                                         _correctImbalance, _stereo);
-                session.Configure(_initialMode, _initialChannel, null, _initialBlanker);
+                session.Configure(_initialMode, _initialChannel, null, _initialBlanker, null);
                 _sessions[id] = session;
                 return session;
             }
@@ -256,6 +256,19 @@ namespace Radiocity.Web
             sb.Append("\"rt\":\"").Append(Escape(rds != null ? rds.RadioText : "")).Append("\",");
             sb.Append("\"pty\":").Append(rds != null ? rds.Pty : 0).Append(',');
             sb.Append("\"groups\":").Append(rds != null ? rds.Groups : 0).Append(',');
+
+            // CTCSS: what is detected, and whether the tone squelch is satisfied.
+            CtcssDecoder ctcss = s.Ctcss;
+            double? expected = s.CtcssTone;
+            bool toneOpen = expected == null ||
+                            (ctcss != null && ctcss.TonePresent &&
+                             (expected.Value <= 0.0 || Math.Abs(ctcss.ToneHz - expected.Value) < 0.5));
+
+            sb.Append("\"ctcss\":").Append(ctcss != null && ctcss.TonePresent
+                ? ctcss.ToneHz.ToString("F1", CultureInfo.InvariantCulture) : "0").Append(',');
+            sb.Append("\"ctcssWanted\":").Append(expected.HasValue
+                ? expected.Value.ToString("F1", CultureInfo.InvariantCulture) : "0").Append(',');
+            sb.Append("\"ctcssOpen\":").Append(toneOpen ? "true" : "false").Append(',');
             sb.Append("\"quadrature\":").Append(_hub.IsQuadrature ? "true" : "false").Append(',');
             sb.Append("\"bandLo\":").Append(_hub.BandLo.ToString("F0", CultureInfo.InvariantCulture)).Append(',');
             sb.Append("\"bandHi\":").Append(_hub.BandHi.ToString("F0", CultureInfo.InvariantCulture)).Append(',');
@@ -285,6 +298,7 @@ namespace Radiocity.Web
                 {
                     case "am": mode = DemodMode.Am; break;
                     case "fm": mode = DemodMode.Fm; break;
+                    case "nfm": mode = DemodMode.Nfm; break;
                     case "usb": mode = DemodMode.Usb; break;
                     case "lsb": mode = DemodMode.Lsb; break;
                     case "cw": mode = DemodMode.Cw; break;
@@ -307,6 +321,17 @@ namespace Radiocity.Web
                     blanker = (bv > 0.0f) ? (float?)bv : null;
             }
 
+            // ctcss: -1 or absent keeps the current setting, 0 means "any tone",
+            // a positive number means that tone in Hz.
+            double? ctcss = s.CtcssTone;
+            string ctcssText = req.Get("ctcss");
+            if (!string.IsNullOrEmpty(ctcssText))
+            {
+                double cv;
+                if (double.TryParse(ctcssText, NumberStyles.Float, CultureInfo.InvariantCulture, out cv))
+                    ctcss = (cv < 0.0) ? (double?)null : (cv > 0.0 ? Ctcss.Nearest(cv) : 0.0);
+            }
+
             // Clamp inside what the receiver can actually see. For a real source
             // that is 0..rate/2; for a quadrature front end it is the full
             // complex band around the local oscillator.
@@ -317,10 +342,11 @@ namespace Radiocity.Web
 
             bool needsRebuild = (mode != s.Mode) || Math.Abs(channel - s.ChannelHz) > 1.0 ||
                                 !Nullable.Equals(squelch, s.SquelchDb) ||
-                                !Nullable.Equals(blanker, s.BlankerThreshold);
+                                !Nullable.Equals(blanker, s.BlankerThreshold) ||
+                                !Nullable.Equals(ctcss, s.CtcssTone);
 
             s.Tune(freq);
-            if (needsRebuild) s.Configure(mode, channel, squelch, blanker);
+            if (needsRebuild) s.Configure(mode, channel, squelch, blanker, ctcss);
 
             return HandleState(req);
         }

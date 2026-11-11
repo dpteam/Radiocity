@@ -56,6 +56,24 @@ namespace Radiocity.Dsp
 
             return sum;
         }
+
+        /// <summary>
+        /// High-pass by spectral inversion: flip the sign of every low-pass tap
+        /// and add one at the centre. The result has the same transition width
+        /// and the same tap count as the low-pass it came from, which is the
+        /// whole point — designing a high-pass from scratch means a different
+        /// window and a different set of surprises.
+        /// </summary>
+        public static float[] HighPass(double cutoff, int taps, double beta)
+        {
+            float[] h = LowPass(cutoff, taps, beta);
+            int delay = (h.Length - 1) / 2;
+
+            for (int n = 0; n < h.Length; n++) h[n] = -h[n];
+            h[delay] += 1.0f;
+
+            return h;
+        }
     }
 
     /// <summary>

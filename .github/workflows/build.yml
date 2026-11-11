@@ -366,6 +366,73 @@ jobs:
             rds-test.err
           if-no-files-found: ignore
 
+      # Radio mode: narrowband FM plus CTCSS tone squelch. The interesting
+      # assertion is the negative one — with the wrong tone the audio must be
+      # silent, not merely quieter.
+      - name: NFM and CTCSS integration test
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Get-Process Radiocity -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+
+          $proc = Start-Process -FilePath "bin\Radiocity.exe" -ArgumentList "web","--sim-radio","--port","8095","--rate","48000" -PassThru -WindowStyle Hidden -RedirectStandardOutput "nfm-test.log" -RedirectStandardError "nfm-test.err"
+
+          try {
+            $ok = $false
+            for ($i = 0; $i -lt 60; $i++) {
+              Start-Sleep -Milliseconds 250
+              try {
+                $probe = New-Object System.Net.Sockets.TcpClient
+                $probe.Connect("127.0.0.1", 8095)
+                $probe.Close()
+                $ok = $true
+                break
+              } catch { }
+            }
+            if (-not $ok) { throw "NFM server did not open port 8095" }
+
+            $state = $null
+            for ($i = 0; $i -lt 40; $i++) {
+              Start-Sleep -Milliseconds 500
+              try { $state = Invoke-RestMethod "http://localhost:8095/state" -TimeoutSec 10 } catch { continue }
+              if ($state.mode -eq "NFM" -and $state.ctcss -gt 0) { break }
+            }
+            if ($null -eq $state) { throw "GET /state never answered" }
+
+            Write-Host "state: mode=$($state.mode) channel=$($state.channel) ctcss=$($state.ctcss)"
+            if ($state.mode -ne "NFM") { throw "mode is $($state.mode), expected NFM" }
+            if ($state.channel -ne 11000) { throw "channel is $($state.channel), expected 11000" }
+            if ([math]::Abs($state.ctcss - 88.5) -gt 0.5) { throw "CTCSS is $($state.ctcss), expected 88.5" }
+
+            # Wrong tone: the gate must close.
+            Invoke-RestMethod "http://localhost:8095/tune" -Method POST -Body "f=0&mode=nfm&bw=11000&ctcss=100" -TimeoutSec 10 | Out-Null
+            Start-Sleep -Seconds 3
+            $closed = Invoke-RestMethod "http://localhost:8095/state" -TimeoutSec 10
+            if ($closed.ctcssOpen -ne $false) { throw "gate stayed open with the wrong CTCSS tone" }
+            Write-Host "wrong tone: gate closed"
+
+            # Right tone: the gate must open.
+            Invoke-RestMethod "http://localhost:8095/tune" -Method POST -Body "f=0&mode=nfm&bw=11000&ctcss=88.5" -TimeoutSec 10 | Out-Null
+            Start-Sleep -Seconds 3
+            $open = Invoke-RestMethod "http://localhost:8095/state" -TimeoutSec 10
+            if ($open.ctcssOpen -ne $true) { throw "gate stayed closed with the right CTCSS tone" }
+            Write-Host "right tone: gate open"
+          }
+          finally {
+            if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
+          }
+
+      - name: Upload NFM test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nfm-test-log
+          path: |
+            nfm-test.log
+            nfm-test.err
+          if-no-files-found: ignore
+
       # The icon is generated, not hand-edited. Rather than compare bytes —
       # GDI+ antialiasing differs between Windows versions, so a hash check
       # would fail for reasons outside anyone's control — parse the file and

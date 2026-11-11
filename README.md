@@ -20,6 +20,7 @@ audio hardware that is already in the machine.
 AM      : distortion 109.5 dB below tone      (below float32 resolution)
 FM      : residual    62.3 dB below tone
 FM st.  : 48 dB channel separation (1 kHz left, 3 kHz right)
+NFM     : 75 dB CTCSS rejection, tone detected to 0.1 Hz
 RDS     : 24 groups, 0 bad blocks, station name and text exact
 SSB     : sideband rejection -111.1 dB
 CW      : carrier -> 700 Hz beat note
@@ -103,6 +104,9 @@ bin\Radiocity.exe dcf77 70 192000 -b24 rem decode the 77.5 kHz time signal
 Add `-stereo` for FM stereo, and `-nb` for the impulse noise blanker (`-nb20` for
 a looser threshold). Both are off by default: on a clean signal a blanker can
 only do harm, and stereo needs a 192 kHz capture.
+
+For the radio mode, `-ctcss` opens the squelch for any CTCSS tone and
+`-ctcss88.5` only for that one.
 | `iq record <file> <freqHz> [sec]` | Record baseband I/Q for offline analysis |
 | `iq demod <file> <out.wav> [mode]` | Demodulate a recording — try any mode on the same capture |
 | `iq info <file>` | Show what a recording contains |
@@ -110,7 +114,7 @@ Add `-nb` to any command to switch on the impulse noise blanker (`-nb20` for a
 looser threshold). It is off by default: on a clean signal a blanker can only
 do harm.
 
-Modes: `am`, `fm`, `usb`, `lsb`, `cw`. Add `-b8`, `-b16`, `-b24` or `-b32` to
+Modes: `am`, `fm`, `nfm`, `usb`, `lsb`, `cw`. Add `-b8`, `-b16`, `-b24` or `-b32` to
 any command to choose the capture depth; `-b24` is strongly recommended for VLF,
 where the signal sits 40 dB under local noise.
 
@@ -153,6 +157,8 @@ affordable on a 2005 CPU.
 | SSB/CW | `src/Dsp/SsbDemod.cs` | Phasing method, 127-tap Hilbert, −111 dB rejection |
 | FM stereo | `src/Dsp/FmStereo.cs` | 19 kHz pilot, 38 kHz subcarrier recovered by squaring the pilot phasor, stereo matrix |
 | RDS | `src/Dsp/Rds.cs` | 57 kHz subcarrier, biphase + differential decode, CRC with offset words, station name and text |
+| NFM | `src/Dsp/Receiver.cs` | ±2.5 kHz deviation, 12.5 kHz channel, 300–3000 Hz speech band |
+| CTCSS | `src/Dsp/Ctcss.cs` | 50 EIA tones, 1 s Goertzel window, tone squelch with hysteresis |
 | AGC | `src/Dsp/Demod.cs` | RMS detector, asymmetric *gain slew* (not an asymmetric detector) |
 | Squelch | `src/Dsp/Squelch.cs` | Hysteresis on channel power, measured before the AGC |
 | Blanker | `src/Dsp/NoiseBlanker.cs` | Impulse detection on the baseband, before the channel filter smears the click |
@@ -182,6 +188,7 @@ Full explanation in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | I/Q file | float32 bit-exact, int16 within half an LSB | metadata survives the round trip |
 | Imbalance | image from −31 dB to −80 dB | blind correction must not need a calibration signal |
 | FM stereo | > 30 dB channel separation | below that the stereo image collapses to mono |
+| NFM | CTCSS tone within 0.5 Hz, > 20 dB below voice | the tone must be found and must not be heard |
 | RDS | exact station name and text | it is digital; "roughly right" means broken |
 | Resampler | amplitude within 2%, > 30 dB | a bad interpolator is audible as dullness |
 | DCF77 | full frame at −40 and −20 dBFS | the second one is a noisy city, not a lab |
@@ -250,13 +257,15 @@ Working: capture and playback, AM, FM, USB, LSB, CW, AGC, squelch, impulse
 blanker, spectrum, offline demodulation, clock calibration, DCF77 decoding,
 8/16/24/32-bit capture, multi-stage decimation, I/Q recording, a **WebSDR front
 end**, **independent tuning for every listener**, a **quadrature front end path**
-with blind I/Q imbalance correction, **FM stereo**, and **RDS**.
+with blind I/Q imbalance correction, **FM stereo**, **RDS**, and a
+**narrowband FM radio mode** with CTCSS tone squelch.
 
 Not yet:
 
 - [ ] RSDN-20 and SAQ decoders.
 - [ ] RDS clock time (group 4A). The layout is documented but not verified
       against a real transmitter, so it is left out rather than shipped wrong.
+- [ ] DCS, the digital successor to CTCSS.
 - [ ] Password and rate limiting on the web server. It is a receiver for a
       trusted network, not a public service.
 
@@ -403,6 +412,51 @@ changes nothing.
 
 The web UI shows the station name and text in a panel under the waterfall, and
 `/state` exposes `pi`, `ps`, `rt`, `pty`, `groups` and `rds`.
+
+## Radio mode (narrowband FM)
+
+```cmd
+bin\Radiocity.exe web --sim-radio            rem synthetic handheld, no hardware
+bin\Radiocity.exe web --iq --mode nfm -ctcss
+bin\Radiocity.exe listen 145500000 60 nfm 192000 -ctcss88.5
+```
+
+NFM is a different receiver from broadcast FM, not a narrower setting:
+
+| | Broadcast FM | Narrowband FM |
+|---|---|---|
+| Deviation | ±75 kHz | ±2.5 kHz |
+| Channel | 180–200 kHz | 12.5 kHz |
+| Baseband | 128–192 kHz | 16 kHz |
+| Audio | 15 kHz, de-emphasis | 300–3000 Hz, no de-emphasis |
+| Extra | stereo, RDS | CTCSS tone squelch |
+
+**CTCSS** is the part that makes it a radio rather than a scanner. A handheld
+transmits a sub-audible tone (67–254 Hz) alongside the voice, and the receiver
+keeps its speaker muted until it hears *its* tone. That is how several groups
+share one channel without hearing each other.
+
+The detector runs on the raw discriminator output, before the 300 Hz high-pass
+that removes the tone from the speaker — the tone and the speech are only 46 Hz
+apart, so the filter that hides the tone is exactly the filter that would blind
+the detector.
+
+```
+ctcss 88.5 Hz        <- tone present
+ctcssWanted 88.5     <- what this receiver listens for
+ctcssOpen true       <- gate open
+```
+
+With the wrong tone configured, the gate stays shut and the audio is silent —
+not quieter, silent. That is the assertion the CI test makes.
+
+Two things worth knowing before pointing this at real hardware:
+
+- **446 MHz is not in the sound card's band.** PMR446 and LPD433 need the same
+  quadrature downconverter as broadcast FM; see [docs/HARDWARE.md](docs/HARDWARE.md).
+- **A handheld is not a repeater.** Its deviation, its antenna and its 0.5 W are
+  all built for a few hundred metres. Expect to need the downconverter's gain,
+  not the receiver's.
 
 ## Recording the air
 

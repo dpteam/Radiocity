@@ -9,7 +9,13 @@ namespace Radiocity.Dsp
         Fm,
         Usb,
         Lsb,
-        Cw
+        Cw,
+
+        /// <summary>
+        /// Narrowband FM: two-way radio, not broadcast. +-2.5 kHz deviation in a
+        /// 12.5 kHz channel, 300-3000 Hz audio, optional CTCSS tone squelch.
+        /// </summary>
+        Nfm
     }
 
     /// <summary>
@@ -69,6 +75,12 @@ namespace Radiocity.Dsp
         /// </summary>
         public bool Rds;
 
+        /// <summary>
+        /// CTCSS tone the receiver will listen for, in Hz; 0 accepts any tone and
+        /// null disables tone squelch entirely (carrier squelch only).
+        /// </summary>
+        public double? CtcssTone;
+
         public ReceiverOptions()
         {
             Mode = DemodMode.Am;
@@ -112,6 +124,23 @@ namespace Radiocity.Dsp
             ReceiverOptions o = Fm(decimation);
             o.FmStereo = true;
             o.Rds = true;
+            return o;
+        }
+
+        /// <summary>
+        /// Narrowband FM, the two-way radio mode: +-2.5 kHz deviation, 12.5 kHz
+        /// channel, 300-3000 Hz audio. No de-emphasis by default, because
+        /// handhelds usually do not apply one and adding it would make a clean
+        /// signal sound thin.
+        /// </summary>
+        public static ReceiverOptions Nfm(int decimation)
+        {
+            ReceiverOptions o = new ReceiverOptions();
+            o.Mode = DemodMode.Nfm;
+            o.Decimation = decimation;
+            o.ChannelHz = 11000.0;          // Carson bandwidth for 2.5 kHz deviation
+            o.DeviationHz = 2500.0;
+            o.DeemphasisUs = 0.0;
             return o;
         }
 
@@ -171,6 +200,15 @@ namespace Radiocity.Dsp
         private readonly RealDecimator _audioDecim;
         private readonly float[] _audioDecimOut;
 
+        private readonly RealDecimator _bandPassLo;
+        private readonly RealDecimator _bandPassHi;
+        private readonly CtcssDecoder _ctcss;
+        private readonly float[] _narrowBuf;
+        private readonly double? _ctcssExpected;
+        private float _ctcssGate = 1.0f;
+        private float _ctcssGateAttack;
+        private float _ctcssGateRelease;
+
         /// <summary>
         /// Pending tune in whole Hz, 0 meaning none. An int so the write is atomic
         /// on every CPU this runs on: the DSP thread reads it at the start of a
@@ -186,6 +224,7 @@ namespace Radiocity.Dsp
 
             _mode = options.Mode;
             SampleRate = sampleRate;
+            _ctcssExpected = options.CtcssTone;
 
             // FM needs a much wider baseband than AM or SSB. A stereo broadcast
             // puts information up to 53 kHz into the composite, so the chain must
@@ -201,6 +240,13 @@ namespace Radiocity.Dsp
                 // demodulation, which is a separate step.
                 double target = Math.Max(options.FmStereo ? 128000.0 : 48000.0, options.ChannelHz * 1.1);
                 decim = Math.Max(1, (int)(sampleRate / target));
+            }
+            else if (_mode == DemodMode.Nfm)
+            {
+                // 16 kHz covers +-2.5 kHz of deviation plus 3 kHz of audio with
+                // room to spare, and it divides both 48 and 192 kHz exactly.
+                // Audio is decimated to 8 kHz after demodulation.
+                decim = Math.Max(1, (int)(sampleRate / 16000.0));
             }
 
             int basebandRate;
@@ -282,11 +328,56 @@ namespace Radiocity.Dsp
                 case DemodMode.Cw:
                     _ssb = new SsbDemod(options.SsbTaps, 32768, OutputRate, options.BfoHz, true);
                     break;
+                case DemodMode.Nfm:
+                    {
+                        _fm = new FmDemod(OutputRate, options.DeviationHz, options.DeemphasisUs);
+
+                        // Band-pass 300-3000 Hz: the speech band. Below 300 Hz
+                        // lives the CTCSS tone, which must not be audible; above
+                        // 3 kHz is discriminator noise that adds nothing.
+                        int baseRate = OutputRate;
+
+                        double lpPass = 3000.0 / baseRate;
+                        double lpStop = Math.Min(0.45, 4500.0 / baseRate);
+                        int lp = (int)Math.Ceiling(62.0 / (2.285 * 2.0 * Math.PI * Math.Max(0.002, lpStop - lpPass)));
+                        if (lp < 31) lp = 31;
+                        if (lp > 1023) lp = 1023;
+
+                        _bandPassLo = new RealDecimator(FirDesign.LowPass((lpPass + lpStop) * 0.5, lp, 8.6), 1);
+
+                        double hpPass = 300.0 / baseRate;
+                        double hpStop = Math.Min(0.44, 200.0 / baseRate);
+                        int hp = (int)Math.Ceiling(62.0 / (2.285 * 2.0 * Math.PI * Math.Max(0.002, hpPass - hpStop)));
+                        if (hp < 31) hp = 31;
+                        if (hp > 1023) hp = 1023;
+
+                        _bandPassHi = new RealDecimator(FirDesign.HighPass((hpPass + hpStop) * 0.5, hp, 8.6), 1);
+
+                        _ctcss = new CtcssDecoder(baseRate);
+
+                        // 16 kHz -> 8 kHz. Half of what the card was told, and
+                        // exactly the rate the card will accept.
+                        int audioDecim = Math.Max(1, baseRate / 8000);
+                        if (audioDecim > 1)
+                        {
+                            double pass = 3000.0 / baseRate;
+                            double stop = 0.5 / audioDecim;
+                            int taps = (stop - pass < 0.002)
+                                ? 63
+                                : (int)Math.Ceiling(62.0 / (2.285 * 2.0 * Math.PI * (stop - pass)));
+
+                            _audioDecim = new RealDecimator(
+                                FirDesign.LowPass((pass + stop) * 0.5, taps, 8.6), audioDecim);
+                            OutputRate = baseRate / audioDecim;
+                        }
+                    }
+                    break;
             }
 
             // SSB and CW have no carrier to lock onto, so the AGC must be slower:
             // a fast release on speech pumps the noise floor between syllables.
-            bool voice = _mode == DemodMode.Usb || _mode == DemodMode.Lsb || _mode == DemodMode.Cw;
+            bool voice = _mode == DemodMode.Usb || _mode == DemodMode.Lsb ||
+                         _mode == DemodMode.Cw || _mode == DemodMode.Nfm;
             _agc = voice ? new Agc(OutputRate, 40.0, 600.0, 0.30) : new Agc(OutputRate, 25.0, 400.0, 0.30);
             _agcEnabled = options.AgcEnabled;
 
@@ -317,8 +408,19 @@ namespace Radiocity.Dsp
             _audio = new float[block];
             _stereoOut = new float[block * 2];
             _audioDecimOut = new float[block];
+            _narrowBuf = new float[block];
 
             if (Channels == 0) Channels = 1;
+
+            if (_mode == DemodMode.Nfm && _ctcssExpected.HasValue)
+            {
+                // 5 ms to open, 80 ms to close. Opening fast means the first
+                // syllable is not chopped; closing slowly means a fading carrier
+                // does not make the gate chatter.
+                _ctcssGateAttack = (float)(1.0 - Math.Exp(-1.0 / (OutputRate * 0.005)));
+                _ctcssGateRelease = (float)(1.0 - Math.Exp(-1.0 / (OutputRate * 0.080)));
+                _ctcssGate = 0.0f;
+            }
         }
 
         public double SampleRate { get; private set; }
@@ -362,6 +464,9 @@ namespace Radiocity.Dsp
 
         /// <summary>RDS decoder, or null when RDS is not enabled.</summary>
         public RdsDecoder Rds { get { return _rds; } }
+
+        /// <summary>CTCSS detector, or null outside narrowband FM.</summary>
+        public CtcssDecoder Ctcss { get { return _ctcss; } }
 
         /// <summary>Safe to call from any thread; takes effect at the next block.</summary>
         public void SetTune(double hz)
@@ -428,6 +533,38 @@ namespace Radiocity.Dsp
             return Demodulate(i, q, n, output);
         }
 
+        /// <summary>
+        /// Narrowband FM post-processing: measure CTCSS, then band-limit to the
+        /// speech band, then apply tone squelch.
+        ///
+        /// The order matters. CTCSS is a sub-audible tone at 67-254 Hz and the
+        /// band-pass below starts at 300 Hz, so measuring after the filter would
+        /// find nothing. Conversely the tone must not reach the speaker, which is
+        /// exactly what the high-pass is for.
+        /// </summary>
+        private void ShapeNfmAudio(int n)
+        {
+            if (_ctcss != null) _ctcss.Process(_audio, n);
+
+            int a = _bandPassHi.Process(_audio, n, _narrowBuf);
+            int b = _bandPassLo.Process(_narrowBuf, a, _audio);
+
+            if (_ctcssExpected == null) return;
+
+            bool open = _ctcss.TonePresent &&
+                        (_ctcssExpected.Value <= 0.0 ||
+                         Math.Abs(_ctcss.ToneHz - _ctcssExpected.Value) < 0.5);
+
+            float target = open ? 1.0f : 0.0f;
+
+            for (int k = 0; k < b; k++)
+            {
+                float slew = (target > _ctcssGate) ? _ctcssGateAttack : _ctcssGateRelease;
+                _ctcssGate += slew * (target - _ctcssGate);
+                _audio[k] *= _ctcssGate;
+            }
+        }
+
         private int Demodulate(float[] srcI, float[] srcQ, int n, float[] output)
         {
             // The blanker runs first: an impulse that reaches the channel filter
@@ -452,9 +589,15 @@ namespace Radiocity.Dsp
             switch (_mode)
             {
                 case DemodMode.Am: _am.Process(_bi, _bq, m, _audio); break;
-                case DemodMode.Fm: _fm.Process(_bi, _bq, m, _audio); break;
+                case DemodMode.Fm:
+                case DemodMode.Nfm: _fm.Process(_bi, _bq, m, _audio); break;
                 default: _ssb.Process(_bi, _bq, m, _audio); break;
             }
+
+            // Narrowband FM shapes the discriminator output into speech: CTCSS is
+            // measured first, because the band-pass that follows is designed to
+            // remove exactly the band it lives in.
+            if (_mode == DemodMode.Nfm) ShapeNfmAudio(m);
 
             // RDS reads the composite, so it has to run before the stereo decoder
             // turns that composite into audio.

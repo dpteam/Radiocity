@@ -30,6 +30,12 @@ namespace Radiocity.App
         /// <summary>Decode FM stereo. Set with -stereo / --stereo.</summary>
         private static bool StereoRequested;
 
+        /// <summary>
+        /// CTCSS tone squelch. Null means off; 0 means "any tone"; a number means
+        /// that specific tone in Hz. Set with -ctcss (any) or -ctcss88.5.
+        /// </summary>
+        private static double? CtcssRequested;
+
         private static int Main(string[] args)
         {
             // A pool thread that throws takes the whole process down. Say why,
@@ -85,6 +91,14 @@ namespace Radiocity.App
                 else if (a == "-b32") CaptureBits = 32;
                 else if (a == "-nb") BlankerThreshold = 12.0f;
                 else if (a == "-stereo" || a == "--stereo") StereoRequested = true;
+                else if (a == "-ctcss") CtcssRequested = 0.0;
+                else if (a.StartsWith("-ctcss") && a.Length > 6)
+                {
+                    double t;
+                    if (double.TryParse(a.Substring(6), NumberStyles.Float, Inv, out t))
+                        CtcssRequested = Ctcss.Nearest(t);
+                    else rest.Add(args[i]);
+                }
                 else if (a.StartsWith("-nb") && a.Length > 3)
                 {
                     float t;
@@ -152,6 +166,8 @@ namespace Radiocity.App
             ok &= RunFmTest();
             Console.WriteLine();
             ok &= RunFmStereoTest();
+            Console.WriteLine();
+            ok &= RunNfmTest();
             Console.WriteLine();
             ok &= RunRdsTest();
             Console.WriteLine();
@@ -878,6 +894,68 @@ namespace Radiocity.App
             return new int[] { pi, bb, cc, dd };
         }
 
+        private static bool RunNfmTest()
+        {
+            // Narrowband FM: +-2.5 kHz deviation, a 1 kHz voice tone, and an
+            // 88.5 Hz CTCSS tone riding underneath it. The CTCSS tone must be
+            // detected AND must not be audible in the audio output.
+            const double fs = 48000.0;
+            const double tone = 1000.0;
+            const double ctcssHz = 88.5;
+            const double deviation = 2500.0;
+
+            int n = (int)(fs * 6.0);
+
+            float[] bi = new float[n];
+            float[] bq = new float[n];
+            double phase = 0.0;
+
+            for (int k = 0; k < n; k++)
+            {
+                double t = k / fs;
+                double voice = 0.5 * Math.Cos(2.0 * Math.PI * tone * t);
+                double ctcss = 0.15 * Math.Cos(2.0 * Math.PI * ctcssHz * t);
+
+                bi[k] = (float)Math.Cos(phase);
+                bq[k] = (float)Math.Sin(phase);
+                phase += 2.0 * Math.PI * deviation * (voice + ctcss) / fs;
+            }
+
+            ReceiverOptions o = ReceiverOptions.Nfm(1);
+            o.AgcEnabled = false;
+
+            Receiver rx = new Receiver(fs, 0.0, o);
+            float[] output = RunComplex(rx, bi, bq);
+
+            double residual, unused;
+            double voiceLevel = MeasureTone(output, rx.OutputRate, tone, out residual);
+            double ctcssLeak = MeasureTone(output, rx.OutputRate, ctcssHz, out unused);
+
+            Console.WriteLine("narrowband FM self-test");
+            Console.WriteLine("  +-2.5 kHz deviation, 1 kHz voice, 88.5 Hz CTCSS, 12.5 kHz channel");
+            Console.WriteLine("  baseband " + rx.OutputRate + " Hz audio, " + rx.Channels + " channel(s)");
+            Console.WriteLine("  voice tone  : " + voiceLevel.ToString("F3", Inv));
+            Console.WriteLine("  CTCSS leak  : " + ctcssLeak.ToString("F4", Inv) +
+                              "  (" + Db(voiceLevel / Math.Max(ctcssLeak, 1e-12)).ToString("F1", Inv) + " dB below voice)");
+
+            bool toneOk = false;
+            if (rx.Ctcss != null)
+            {
+                toneOk = Math.Abs(rx.Ctcss.ToneHz - ctcssHz) < 0.5;
+                Console.WriteLine("  CTCSS detected: " + (rx.Ctcss.ToneHz > 0
+                    ? rx.Ctcss.ToneHz.ToString("F1", Inv) + " Hz"
+                    : "none") + " at level " + rx.Ctcss.ToneLevel.ToString("F4", Inv));
+            }
+
+            // The voice tone survives, the sub-audible tone does not, and the
+            // detector names the right frequency.
+            bool ok = Math.Abs(voiceLevel - 0.5) < 0.08 && toneOk &&
+                      Db(voiceLevel / Math.Max(ctcssLeak, 1e-12)) > 20.0;
+
+            Console.WriteLine(ok ? "  PASS" : "  FAIL: narrowband FM path is wrong");
+            return ok;
+        }
+
         private static bool RunImbalanceTest()
         {
             // A real quadrature front end has two analogue paths that are never
@@ -1130,6 +1208,7 @@ namespace Radiocity.App
             switch (mode.ToLowerInvariant())
             {
                 case "fm": o = ReceiverOptions.Fm(decim); break;
+                case "nfm": o = ReceiverOptions.Nfm(decim); break;
                 case "usb": o = ReceiverOptions.Ssb(true, decim); break;
                 case "lsb": o = ReceiverOptions.Ssb(false, decim); break;
                 case "cw": o = ReceiverOptions.Cw(700.0, decim); break;
@@ -1140,6 +1219,7 @@ namespace Radiocity.App
             }
 
             o.BlankerThreshold = BlankerThreshold;
+            o.CtcssTone = CtcssRequested;
             return o;
         }
 
@@ -1476,6 +1556,7 @@ namespace Radiocity.App
             bool quadrature = false;
             bool simulatedQuadrature = false;
             bool simulatedFm = false;
+            bool simulatedRadio = false;
             bool correctImbalance = true;
             int port = 8080;
             int rate = 48000;
@@ -1491,6 +1572,7 @@ namespace Radiocity.App
                 else if (a == "--iq") quadrature = true;
                 else if (a == "--sim-iq") simulatedQuadrature = true;
                 else if (a == "--sim-fm") simulatedFm = true;
+                else if (a == "--sim-radio") simulatedRadio = true;
                 else if (a == "--no-imbalance") correctImbalance = false;
                 else if (a == "--port" && i + 1 < args.Length) port = int.Parse(args[++i], Inv);
                 else if (a == "--rate" && i + 1 < args.Length) rate = int.Parse(args[++i], Inv);
@@ -1502,7 +1584,15 @@ namespace Radiocity.App
 
             ISampleSource source;
 
-            if (simulatedFm)
+            if (simulatedRadio)
+            {
+                // A handheld: narrowband FM, voice-like audio, 88.5 Hz CTCSS.
+                source = new SyntheticRadioSource(rate, 2500.0, 88.5);
+                mode = DemodMode.Nfm;
+                freq = 0.0;
+                Console.WriteLine("source: " + source.Description + " (no hardware needed)");
+            }
+            else if (simulatedFm)
             {
                 // A whole FM stereo station with RDS, so the web UI can be shown
                 // end to end on a machine with no sound card and no antenna.
@@ -1762,6 +1852,7 @@ namespace Radiocity.App
             switch (mode)
             {
                 case DemodMode.Fm: return 180000.0;
+                case DemodMode.Nfm: return 11000.0;
                 case DemodMode.Usb:
                 case DemodMode.Lsb: return 2400.0;
                 case DemodMode.Cw: return 500.0;

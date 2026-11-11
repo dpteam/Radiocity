@@ -9,7 +9,36 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Planned
 - RSDN-20 and SAQ decoders
 - RDS clock time (group 4A), verified against a real transmitter
+- DCS (digital coded squelch) alongside CTCSS
 - Optional password and rate limiting for the web server
+
+## [0.11.0] - 2026-11-12
+
+### Added
+- **Narrowband FM** (`nfm`) — the two-way radio mode: ±2.5 kHz deviation in a
+  12.5 kHz channel, 300–3000 Hz audio band-pass, no de-emphasis by default.
+- **CTCSS decoder** — all 50 EIA sub-audible tones, detected with a one-second
+  Goertzel window after a two-stage decimating low-pass. Reports the tone in Hz.
+- **Tone squelch** — `-ctcss` opens the gate for any tone, `-ctcss88.5` for a
+  specific one. The gate ramps in 5 ms and out 80 ms, so it does not click.
+- `SyntheticRadioSource` and `web --sim-radio`: a handheld transmitting a
+  voice-like tone with 88.5 Hz CTCSS, so the radio path is demonstrable and
+  testable without hardware.
+- CTCSS badge in the web UI; `ctcss`, `ctcssWanted` and `ctcssOpen` in `/state`;
+  `ctcss` parameter on `/tune`.
+- NFM and CTCSS integration test in CI, including the negative case (wrong tone
+  must produce silence, not just quieter audio).
+
+### Changed
+- `FirDesign.HighPass` via spectral inversion, so the speech band-pass is a
+  low-pass and a high-pass with the same tap count and transition width.
+- `Squelch` takes separate detector and gate rates.
+
+### Notes
+- The audio band-pass and the CTCSS detector disagree by design: the tone lives
+  at 67–254 Hz and speech starts at 300 Hz, so the detector taps the
+  discriminator output *before* the high-pass that removes the tone from the
+  speaker.
 
 ## [0.10.0] - 2026-11-12
 

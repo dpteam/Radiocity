@@ -387,6 +387,49 @@ Clock time (group 4A) is not implemented. Its field layout is easy to get
 subtly wrong and impossible to verify without a real transmitter, and a wrong
 clock is worse than no clock.
 
+## Narrowband FM and CTCSS — `src/Dsp/Receiver.cs`, `src/Dsp/Ctcss.cs`
+
+NFM is a separate path, not a setting on the broadcast FM one:
+
+| | Broadcast FM | NFM |
+|---|---|---|
+| Baseband | 128–192 kHz | 16 kHz |
+| Deviation | ±75 kHz | ±2.5 kHz |
+| Audio | 15 kHz + de-emphasis | 300–3000 Hz band-pass, no de-emphasis |
+
+```
+capture -> mix -> ÷D to 16 kHz -> discriminator -> [CTCSS tap] -> 300-3000 Hz
+                                                    -> ÷2 to 8 kHz -> AGC -> out
+```
+
+16 kHz is chosen because Carson's rule gives 2 × (2.5 + 3) = 11 kHz, and 16 kHz
+divides both 48 and 192 exactly. Audio then halves to 8 kHz, which every card
+accepts and which is above the 3 kHz speech band.
+
+**The band-pass** is a low-pass at 3 kHz and a high-pass at 300 Hz. The high-pass
+comes from spectral inversion of a low-pass — flip every tap and add one at the
+centre — because designing a high-pass directly means a different window and a
+different set of surprises for the same tap count.
+
+**CTCSS** is the interesting part. It is a sub-audible tone at 67–254 Hz that
+gates the squelch, and it lives 46 Hz below where speech starts. Two consequences:
+
+- The detector must tap the discriminator output *before* the high-pass. After
+  the filter there is nothing left to detect — the filter that hides the tone
+  from the speaker is the filter that would blind the receiver.
+- The detector's frequency resolution has to separate 67.0 from 69.3 Hz. One
+  second of analysis at 1 kHz gives 1 Hz resolution, which does it; the two
+  decimating stages before it (16k → 4k → 1k) make that cheap.
+
+Detection requires the winner to beat the runner-up by 2×, because "some bin is
+the largest" is true even in silence. Without that margin the gate opens on noise.
+
+**Tone squelch** ramps in 5 ms and out 80 ms. Opening fast avoids chopping the
+first syllable; closing slowly stops a fading carrier from making the gate
+chatter. A freshly built receiver starts muted and needs one full analysis
+window (1 s) before it can open — correct, but worth knowing when a test appears
+to fail immediately after a mode change.
+
 ## Performance notes
 
 Everything in `Process()` is preallocated. The whole AM chain at 48 kHz runs in

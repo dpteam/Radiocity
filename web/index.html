@@ -226,12 +226,14 @@
   <div class="modes" id="modes">
     <button data-mode="am">AM</button>
     <button data-mode="fm">FM</button>
+    <button data-mode="nfm">NFM</button>
     <button data-mode="usb">USB</button>
     <button data-mode="lsb">LSB</button>
     <button data-mode="cw">CW</button>
   </div>
   <div class="row" style="margin-left:auto">
     <span class="badge" id="sessBadge">1 receiver</span>
+    <span class="badge" id="ctcssBadge">ctcss —</span>
     <span class="badge" id="stereoBadge">mono</span>
     <span class="badge" id="squelchBadge">squelch</span>
     <button id="audioBtn" class="primary">▶ Listen</button>
@@ -464,6 +466,25 @@
       else { stereoBadge.className = "badge"; stereoBadge.textContent = "mono"; }
     }
 
+    // CTCSS: only meaningful in narrowband FM. Shows the tone that is present
+    // and whether the tone squelch is letting audio through.
+    var ctcssBadge = document.getElementById("ctcssBadge");
+    if (ctcssBadge) {
+      var tone = s.ctcss || 0;
+      var wanted = s.ctcssWanted || 0;
+
+      if (tone > 0) {
+        ctcssBadge.className = "badge on";
+        ctcssBadge.textContent = "ctcss " + tone.toFixed(1) + " Hz";
+      } else if (wanted > 0) {
+        ctcssBadge.className = "badge";
+        ctcssBadge.textContent = "want " + wanted.toFixed(1) + " Hz";
+      } else {
+        ctcssBadge.className = "badge";
+        ctcssBadge.textContent = "ctcss \u2014";
+      }
+    }
+
     // RDS: only meaningful when a station actually transmits it.
     var pi = document.getElementById("rdsPi");
     var ps = document.getElementById("rdsPs");
@@ -553,8 +574,9 @@
       btn.className = "active";
       state.mode = btn.getAttribute("data-mode").toUpperCase();
 
-      // Sensible default width per mode, so switching to CW actually narrows.
-      var bw = { AM: 9000, FM: 180000, USB: 2400, LSB: 2400, CW: 500 }[state.mode] || 9000;
+      // Sensible default width per mode, so switching to CW actually narrows
+      // and switching to NFM actually sounds like a handheld.
+      var bw = { AM: 9000, FM: 180000, NFM: 11000, USB: 2400, LSB: 2400, CW: 500 }[state.mode] || 9000;
       if (bw > rate / 2) bw = Math.round(rate / 2 * 0.8);
       document.getElementById("bwRange").value = bw;
       document.getElementById("bwOut").textContent = bw;
