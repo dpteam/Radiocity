@@ -210,6 +210,12 @@ namespace Radiocity.Dsp
         public int Taps { get { return _chain.TotalTaps; } }
         public int DecimationStages { get { return _chain.Stages; } }
 
+        /// <summary>Tap count of each decimation stage, in order.</summary>
+        public int[] StageTaps { get { return _chain.StageTaps; } }
+
+        /// <summary>Input rate of each decimation stage, in order.</summary>
+        public double[] StageRates { get { return _chain.StageRates; } }
+
         /// <summary>Filter multiply-adds per second; the real cost figure.</summary>
         public double FilterCost { get { return _chain.CostPerSecond; } }
         public DemodMode Mode { get { return _mode; } }

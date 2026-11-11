@@ -154,6 +154,51 @@ Three things that break naive decoders:
 Frame sync comes from the missing pulse at second 59: the gap across a minute
 boundary is ~2 s instead of ~1 s.
 
+## Impulse blanking — `src/Dsp/NoiseBlanker.cs`
+
+A squelch answers "is there a signal". A blanker answers "is this sample a
+click", and removes the click while keeping the signal under it. Ignition
+noise, switch-mode hash and lightning all arrive as very short, very loud
+spikes — a handful of samples at any baseband rate — so blanking them is nearly
+free, while filtering them out is not: a filter that removes a one-sample spike
+also removes everything else at that bandwidth.
+
+It runs **before** the channel filter, on the complex baseband. After the filter
+the impulse has already been convolved with the whole impulse response, and by
+then removing it means removing the signal too.
+
+Two things make the difference between working and deaf:
+
+1. **Warm-up.** The reference level starts at zero, so the threshold starts
+   below the signal itself. The detector then blanks the signal, blanked samples
+   never update the reference, and the blanker locks itself out permanently.
+   It measures for 50 ms first, with no blanking.
+2. **Clamped reference.** While blanking, the reference is fed
+   `threshold × average` rather than the actual (huge) value, so a burst of
+   clicks cannot raise the threshold above its own amplitude and blind the
+   detector.
+
+The test measures error against a *known* clean signal, which is the only way
+to answer "did blanking help" rather than "did blanking happen".
+
+## Recording I/Q — `src/Dsp/IqFile.cs`
+
+A recording is the output of the mixer, so it can be replayed through any
+demodulator without going back to the air. That is the difference between
+"I heard something" and "I have the evidence".
+
+Format: stereo WAV, I in the left channel, Q in the right, 32-bit float by
+default (a 24-bit card's baseband has more range than int16 can carry, and
+clipping a recording cannot be undone). The centre frequency goes into a
+`LIST/INFO` comment as `center=77500`.
+
+Why WAV and not a raw dump with a sidecar README: the WAV opens in Audacity, SoX
+and Python, and the header carries the sample rate where it belongs. A raw file
+plus a text file is a format that only works if the text file survives.
+
+`Receiver.ProcessBaseband` is the piece that makes replay possible: the
+demodulation half of the chain, callable on already-mixed I/Q.
+
 ## The web layer — `src/Web/`
 
 One receiver, many listeners. The DSP runs whether anyone is connected or not;

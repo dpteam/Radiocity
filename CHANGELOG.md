@@ -7,10 +7,33 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Planned
-- I/Q recording to file
-- Noise blanker (impulse rejection)
 - RSDN-20 and SAQ decoders
 - Multiple simultaneous listeners with independent tuning
+- Stereo capture, so a downconverter's I/Q can be recorded directly
+
+## [0.6.0] - 2026-11-12
+
+### Added
+- **I/Q recording** (`radiocity iq record|demod|info`) — captures the baseband
+  the demodulators see and stores it as a stereo WAV (I left, Q right, 32-bit
+  float, centre frequency in a `LIST/INFO` comment). One capture can then be
+  replayed through AM, FM, USB, LSB and CW without going back to the air.
+- **Impulse noise blanker** (`NoiseBlanker`, `-nb`, and a checkbox in the web
+  UI) — detects spikes against a slow power average and blanks them before the
+  channel filter smears the click across its whole impulse response.
+- `Receiver.ProcessBaseband` — the demodulation half of the chain, callable on
+  already-mixed I/Q. This is what makes recorded I/Q replayable.
+- Selftests for the blanker (measured against a known clean signal) and for the
+  I/Q file (bit-exact float32 round trip, half-an-LSB int16, metadata preserved).
+
+### Fixed
+- **The noise blanker deafened itself.** Its reference level starts at zero, so
+  the threshold starts *below* the signal, the detector blanks the signal, and
+  blanked samples never update the reference — a deadlock that looks exactly
+  like a receiver gone deaf. It now runs a 50 ms warm-up where it only measures,
+  and feeds the reference a clamped value while blanking.
+- `IqFile` scaled int16 by 32767 but read it back divided by 32768, a systematic
+  one-LSB error at full scale. Now symmetric, with rounding.
 
 ## [0.5.0] - 2026-11-12
 

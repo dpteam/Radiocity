@@ -101,6 +101,14 @@ jobs:
             if ($tuned.mode -ne "CW") { throw "mode switch did not take effect" }
             Write-Host "tuned: $($tuned | ConvertTo-Json -Compress)"
 
+            # The blanker has to survive the round trip through the HTTP layer,
+            # not just work as a class.
+            $on = Invoke-RestMethod "http://localhost:8099/tune" -Method POST -Body "f=3000&mode=am&bw=6000&blank=12"
+            if ($on.blank -ne 12) { throw "blanker did not switch on (got $($on.blank))" }
+            $off = Invoke-RestMethod "http://localhost:8099/tune" -Method POST -Body "f=3000&mode=am&bw=6000&blank=0"
+            if ($off.blank -ne 0) { throw "blanker did not switch off (got $($off.blank))" }
+            Write-Host "blanker: on and off both accepted"
+
             # Audio must actually stream PCM, not just answer 200. Read against a
             # time budget rather than an iteration count: chunked responses
             # arrive in whatever sizes the server flushed.

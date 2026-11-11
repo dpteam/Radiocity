@@ -101,9 +101,27 @@ namespace Radiocity.Dsp
             }
         }
 
-        /// <summary>Returns the number of output samples written.</summary>
-        public int Process(float[] inI, float[] inQ, int n, float[] outI, float[] outQ)
+        /// <summary>
+        /// What a single-stage filter would cost for the same job, so the saving
+        /// can be measured instead of asserted. Uses the same Kaiser estimate the
+        /// real design uses; the only difference is doing it in one step.
+        /// </summary>
+        public static int EstimateSingleStageTaps(double rate, int outputRate, double channelHz)
         {
+            int decim = Math.Max(1, (int)Math.Round(rate / outputRate));
+            double pass = Math.Min(channelHz * 0.5, outputRate * 0.45) / rate;
+            double stop = 0.5 / decim;
+
+            if (stop - pass < 0.002) return 63;
+
+            int taps = (int)Math.Ceiling(62.0 / (2.285 * 2.0 * Math.PI * (stop - pass)));
+            if (taps < 15) taps = 15;
+            if (taps > 4095) taps = 4095;
+            return taps;
+        }
+
+        /// <summary>Returns the number of output samples written.</summary>
+        public int Process(float[] inI, float[] inQ, int n, float[] outI, float[] outQ)        {
             float[] curI = inI;
             float[] curQ = inQ;
             int count = n;

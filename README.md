@@ -24,6 +24,8 @@ CW      : carrier -> 700 Hz beat note
 clock   : 27.0 ppm injected, 26.92 ppm measured
 decim   : 192k -> 12k in 2 stages, 4.6x cheaper than one filter
 squelch : mutes on silence, opens on carrier
+blanker : 8.2x less impulse error, tone kept within 1%
+I/Q     : float32 bit-exact round trip, centre frequency preserved
 DCF77   : full telegram decoded at -40 and -20 dBFS
 ```
 
@@ -84,6 +86,12 @@ bin\Radiocity.exe dcf77 70 192000 -b24 rem decode the 77.5 kHz time signal
 | `calib <refHz> [sec] [rate]` | Measure the card's clock error in ppm |
 | `dcf77 [sec] [rate]` | Decode the DCF77 time signal at 77.5 kHz |
 | `web [--sim] [--port N]` | Serve the WebSDR UI (waterfall, audio, tuning) |
+| `iq record <file> <freqHz> [sec]` | Record baseband I/Q for offline analysis |
+| `iq demod <file> <out.wav> [mode]` | Demodulate a recording — try any mode on the same capture |
+| `iq info <file>` | Show what a recording contains |
+Add `-nb` to any command to switch on the impulse noise blanker (`-nb20` for a
+looser threshold). It is off by default: on a clean signal a blanker can only
+do harm.
 
 Modes: `am`, `fm`, `usb`, `lsb`, `cw`. Add `-b8`, `-b16`, `-b24` or `-b32` to
 any command to choose the capture depth; `-b24` is strongly recommended for VLF,
@@ -128,6 +136,8 @@ affordable on a 2005 CPU.
 | SSB/CW | `src/Dsp/SsbDemod.cs` | Phasing method, 127-tap Hilbert, −111 dB rejection |
 | AGC | `src/Dsp/Demod.cs` | RMS detector, asymmetric *gain slew* (not an asymmetric detector) |
 | Squelch | `src/Dsp/Squelch.cs` | Hysteresis on channel power, measured before the AGC |
+| Blanker | `src/Dsp/NoiseBlanker.cs` | Impulse detection on the baseband, before the channel filter smears the click |
+| I/Q file | `src/Dsp/IqFile.cs` | Stereo WAV, float32, centre frequency in a RIFF comment |
 | Resampling | `src/Dsp/Demod.cs` | Catmull-Rom; linear interpolation would droop 3.3 dB at 5 kHz |
 | Clock | `src/Dsp/ClockCalib.cs` | FFT peak + parabolic refinement + Goertzel sweep, under 1 ppm |
 | DCF77 | `src/Dsp/Dcf77.cs` | 100/200 ms dip widths, BCD telegram, three parity bits |
@@ -148,6 +158,8 @@ Full explanation in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | Clock | within 1.5 ppm | 1 ppm at 192 kHz is 0.19 Hz |
 | Decimation | chain output matches, split multiplies back | proves the cheap path is the same path |
 | Squelch | mutes at 0.6 s, opens at 1.6 s, mutes at 2.6 s | follows the signal, not the block |
+| Blanker | 8× less error, tone within 1% | removes the clicks, not the signal |
+| I/Q file | float32 bit-exact, int16 within half an LSB | metadata survives the round trip |
 | Resampler | amplitude within 2%, > 30 dB | a bad interpolator is audible as dullness |
 | DCF77 | full frame at −40 and −20 dBFS | the second one is a noisy city, not a lab |
 
@@ -199,8 +211,7 @@ and why.
 build.cmd                    one-command build with the in-box csc.exe
 src/Audio/WinMM.cs           waveIn/waveOut P/Invoke
 src/Dsp/                     the entire signal processing chain
-src/Web/                     HTTP server, WebSDR endpoints, synthetic source
-web/index.html               the UI, embedded into the exe as a resource
+src/Web/                     HTTP server, WebSDR endpoints, synthetic sourceweb/index.html               the UI, embedded into the exe as a resource
 src/App/                     CLI, WAV reader/writer, assembly info
 tools/make-icon.ps1          generates assets/radiocity.ico (reproducible, not hand-drawn)
 docs/ARCHITECTURE.md         how it works and why each stage is built that way
@@ -211,18 +222,36 @@ docs/HARDWARE.md             antennas and downconverters, by budget
 
 ## Status
 
-Working: capture and playback, AM, FM, USB, LSB, CW, AGC, squelch, spectrum,
-offline demodulation, clock calibration, DCF77 decoding, 8/16/24/32-bit capture,
-multi-stage decimation, and a **WebSDR front end**.
+Working: capture and playback, AM, FM, USB, LSB, CW, AGC, squelch, impulse
+blanker, spectrum, offline demodulation, clock calibration, DCF77 decoding,
+8/16/24/32-bit capture, multi-stage decimation, I/Q recording, and a **WebSDR
+front end**.
 
 Not yet:
 
-- [ ] I/Q recording to file, so the air can be analysed offline.
-- [ ] Noise blanker (impulse rejection) — the squelch handles "no signal", not
-      "signal buried in clicks".
 - [ ] RSDN-20 and SAQ decoders.
 - [ ] Multiple simultaneous listeners with independent tuning (one receiver,
       one tuning today; clients share it).
+- [ ] Stereo capture, so a quadrature downconverter's I/Q can be recorded
+      directly instead of being synthesised by the mixer.
+
+## Recording the air
+
+```
+bin\Radiocity.exe iq record capture.wav 77500 30 192000 -b24
+bin\Radiocity.exe iq info capture.wav
+bin\Radiocity.exe iq demod capture.wav am.wav am
+bin\Radiocity.exe iq demod capture.wav usb.wav usb
+```
+
+The recording is the baseband the demodulators see, so one capture can be
+replayed through every mode without going back to the air. That is the
+difference between "I heard something" and "I have the evidence".
+
+The format is a stereo WAV — I in the left channel, Q in the right — with
+32-bit float samples and the centre frequency in a `LIST/INFO` comment. It
+opens in Audacity, SoX and Python, and the header carries the sample rate
+where it belongs. A raw dump plus a README is not a file format.
 
 ## WebSDR
 

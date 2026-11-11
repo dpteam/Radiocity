@@ -151,7 +151,7 @@ namespace Radiocity.App
             Console.WriteLine();
             ok &= RunCalibTest();
             Console.WriteLine();
-            ok &= RunDecimationTest();
+            ok &= RunDecimationChainTest();
             Console.WriteLine();
             ok &= RunSquelchTest();
             Console.WriteLine();
@@ -366,127 +366,6 @@ namespace Radiocity.App
             return ok;
         }
 
-        private static bool RunDecimationTest()
-        {
-            // At 192 kHz, a 9 kHz AM channel needs a transition band of 1.5 kHz.
-            // One filter doing that in a single step is expensive; splitting it
-            // 192k -> 24k -> 12k is roughly four times cheaper for the same
-            // result. This measures both, so the claim is checkable.
-            const double fs = 192000.0;
-            const double carrier = 30000.0;
-            const double tone = 1000.0;
-            const int decim = 16;
-
-            int n = (int)(fs * 2.0);
-            float[] input = new float[n];
-            for (int i = 0; i < n; i++)
-            {
-                double t = i / fs;
-                double m = 1.0 + 0.6 * Math.Cos(2.0 * Math.PI * tone * t);
-                input[i] = (float)(m * Math.Cos(2.0 * Math.PI * carrier * t) / 1.6);
-            }
-
-            ReceiverOptions o = ReceiverOptions.Am(decim);
-            o.ChannelHz = 9000.0;
-
-            Receiver rx = new Receiver(fs, carrier, o);
-            float[] output = Run(rx, input);
-
-            double residual;
-            double level = MeasureTone(output, rx.OutputRate, tone, out residual);
-
-            // Single-stage cost, computed with the same Kaiser formula.
-            double pass = 4500.0 / fs;
-            double stop = 0.5 / decim;
-            int singleTaps = (int)Math.Ceiling(62.0 / (2.285 * 2.0 * Math.PI * (stop - pass)));
-            double singleMacs = singleTaps * fs;
-
-            Console.WriteLine("decimation self-test");
-            Console.WriteLine("  192 kHz -> " + rx.OutputRate + " Hz in " + rx.DecimationStages +
-                              " stage(s), " + rx.Taps + " taps total");
-            Console.WriteLine("  single stage would need " + singleTaps + " taps at " + fs.ToString("F0", Inv) +
-                              " Hz = " + (singleMacs / 1e6).ToString("F0", Inv) + " M multiply-adds/s");
-            Console.WriteLine("  this chain costs " + (rx.FilterCost / 1e6).ToString("F0", Inv) +
-                              " M/s, so " + (singleMacs / Math.Max(1.0, rx.FilterCost)).ToString("F1", Inv) + "x cheaper");
-            Console.WriteLine("  tone " + level.ToString("F3", Inv) + ", distortion " +
-                              Db(level / residual).ToString("F1", Inv) + " dB below");
-
-            bool ok = Math.Abs(level - 0.30) < 0.03 && rx.DecimationStages >= 2;
-
-            // Split factors must multiply back to the requested decimation.
-            int[] parts = DecimationChain.SplitDecimation(decim);
-            int product = 1;
-            for (int i = 0; i < parts.Length; i++)
-            {
-                product *= parts[i];
-                if (parts[i] > 8) ok = false;
-            }
-            if (product != decim) ok = false;
-
-            Console.WriteLine("  split of x" + decim + ": " + string.Join(" x ", IntToStrings(parts)) +
-                              " = " + product);
-            Console.WriteLine(ok ? "  PASS" : "  FAIL: chain output or split is wrong");
-            return ok;
-        }
-
-        private static string[] IntToStrings(int[] values)
-        {
-            string[] s = new string[values.Length];
-            for (int i = 0; i < values.Length; i++) s[i] = values[i].ToString(Inv);
-            return s;
-        }
-
-        private static bool RunSquelchTest()
-        {
-            const double fs = 48000.0;
-            const double carrier = 12000.0;
-            int n = (int)(fs * 3.0);
-
-            // One second of nothing, one second of carrier, one second of nothing.
-            float[] input = new float[n];
-            for (int i = 0; i < n; i++)
-            {
-                double t = i / fs;
-                bool on = t >= 1.0 && t < 2.0;
-                input[i] = on ? (float)Math.Cos(2.0 * Math.PI * carrier * t) : 0.0f;
-            }
-
-            ReceiverOptions o = ReceiverOptions.Am(4);
-            o.SquelchDb = -40.0f;
-
-            Receiver rx = new Receiver(fs, carrier, o);
-
-            float[] block = new float[rx.MaxBlock];
-            float[] audio = new float[rx.MaxBlock];
-            bool at05 = false, at15 = false, at25 = false;
-            bool got05 = false, got15 = false, got25 = false;
-            int pos = 0;
-
-            while (pos < n)
-            {
-                int chunk = Math.Min(rx.MaxBlock, n - pos);
-                Array.Copy(input, pos, block, 0, chunk);
-                rx.Process(block, chunk, audio);
-                pos += chunk;
-
-                // Latch once at each checkpoint. Re-reading every later block
-                // would let the flags follow the signal instead of sampling it.
-                double t = (double)pos / fs;
-                if (!got05 && t >= 0.6) { at05 = rx.Squelch.Open; got05 = true; }
-                if (!got15 && t >= 1.6) { at15 = rx.Squelch.Open; got15 = true; }
-                if (!got25 && t >= 2.6) { at25 = rx.Squelch.Open; got25 = true; }
-            }
-
-            Console.WriteLine("squelch self-test");
-            Console.WriteLine("  1 s silence, 1 s carrier, 1 s silence, threshold -40 dBFS");
-            Console.WriteLine("  gate at 0.6 s: " + (at05 ? "open" : "muted") +
-                              ", at 1.6 s: " + (at15 ? "open" : "muted") +
-                              ", at 2.6 s: " + (at25 ? "open" : "muted"));
-
-            bool ok = !at05 && at15 && !at25;
-            Console.WriteLine(ok ? "  PASS" : "  FAIL: gate did not follow the signal");
-            return ok;
-        }
 
         private static bool RunBlankerTest()
         {
@@ -641,6 +520,114 @@ namespace Radiocity.App
                 try { File.Delete(path); }
                 catch (IOException) { }
             }
+        }
+
+        private static bool RunDecimationChainTest()
+        {
+            // The claim "multi-stage is cheaper" is only worth making if it can
+            // be measured. Same signal, same channel, two ways of getting there.
+            const double fs = 192000.0;
+            const double carrier = 30000.0;
+            const double tone = 1000.0;
+            const double channel = 9000.0;
+            const int decim = 16;
+
+            int n = (int)(fs * 2.0);
+            float[] input = new float[n];
+            for (int i = 0; i < n; i++)
+            {
+                double t = i / fs;
+                double m = 1.0 + 0.6 * Math.Cos(2.0 * Math.PI * tone * t);
+                input[i] = (float)(m * Math.Cos(2.0 * Math.PI * carrier * t) / 1.6);
+            }
+
+            ReceiverOptions o = ReceiverOptions.Am(decim);
+            o.ChannelHz = channel;
+
+            Receiver rx = new Receiver(fs, carrier, o);
+            float[] output = Run(rx, input);
+
+            double residual;
+            double level = MeasureTone(output, rx.OutputRate, tone, out residual);
+
+            int singleTaps = DecimationChain.EstimateSingleStageTaps(fs, rx.OutputRate, channel);
+            double singleCost = singleTaps * fs;
+            double chainCost = rx.FilterCost;
+            double saving = singleCost / Math.Max(1.0, chainCost);
+
+            Console.WriteLine("decimation self-test");
+            Console.WriteLine("  192 kHz -> " + rx.OutputRate + " Hz, " + decim + "x in " + rx.DecimationStages + " stage(s)");
+
+            int[] taps = rx.StageTaps;
+            double[] rates = rx.StageRates;
+            for (int s = 0; s < taps.Length; s++)
+            {
+                Console.WriteLine("    stage " + (s + 1) + ": " + taps[s] + " taps at " +
+                                  rates[s].ToString("F0", Inv) + " Hz = " +
+                                  (taps[s] * rates[s] / 1e6).ToString("F1", Inv) + " M/s");
+            }
+
+            Console.WriteLine("  single stage would need " + singleTaps + " taps = " +
+                              (singleCost / 1e6).ToString("F1", Inv) + " M/s");
+            Console.WriteLine("  this chain: " + (chainCost / 1e6).ToString("F1", Inv) + " M/s (" +
+                              saving.ToString("F1", Inv) + "x cheaper)");
+            Console.WriteLine("  tone " + level.ToString("F3", Inv) + ", distortion " +
+                              Db(level / residual).ToString("F1", Inv) + " dB below");
+
+            bool ok = Math.Abs(level - 0.30) < 0.03 && saving > 1.5 && rx.DecimationStages > 1;
+            Console.WriteLine(ok ? "  PASS" : "  FAIL: chain output or the saving is wrong");
+            return ok;
+        }
+
+        private static bool RunSquelchTest()
+        {
+            const double fs = 48000.0;
+            const double carrier = 12000.0;
+            int n = (int)(fs * 3.0);
+
+            // One second of silence, one second of carrier, one second of silence.
+            float[] input = new float[n];
+            for (int i = 0; i < n; i++)
+            {
+                double t = i / fs;
+                bool on = t >= 1.0 && t < 2.0;
+                input[i] = on ? (float)Math.Cos(2.0 * Math.PI * carrier * t) : 0.0f;
+            }
+
+            ReceiverOptions o = ReceiverOptions.Am(4);
+            o.SquelchDb = -40.0f;
+
+            Receiver rx = new Receiver(fs, carrier, o);
+
+            float[] block = new float[rx.MaxBlock];
+            float[] audio = new float[rx.MaxBlock];
+            bool at07 = false, at17 = false, at27 = false;
+            int pos = 0, seen = 0;
+
+            // 4096-sample blocks, so the checkpoints land inside the intended
+            // second rather than at whatever block boundary happens to fall.
+            while (pos < n)
+            {
+                int chunk = Math.Min(4096, n - pos);
+                Array.Copy(input, pos, block, 0, chunk);
+                rx.Process(block, chunk, audio);
+                pos += chunk;
+
+                double t = (double)pos / fs;
+                if (seen == 0 && t >= 0.7) { at07 = rx.Squelch.Open; seen = 1; }
+                else if (seen == 1 && t >= 1.7) { at17 = rx.Squelch.Open; seen = 2; }
+                else if (seen == 2 && t >= 2.7) { at27 = rx.Squelch.Open; seen = 3; }
+            }
+
+            Console.WriteLine("squelch self-test");
+            Console.WriteLine("  silence / carrier / silence, threshold -40 dBFS");
+            Console.WriteLine("  gate at 0.7 s: " + (at07 ? "open" : "muted") +
+                              ", 1.7 s: " + (at17 ? "open" : "muted") +
+                              ", 2.7 s: " + (at27 ? "open" : "muted"));
+
+            bool ok = !at07 && at17 && !at27;
+            Console.WriteLine(ok ? "  PASS" : "  FAIL: gate did not follow the signal");
+            return ok;
         }
 
         private static bool RunResamplerTest()
