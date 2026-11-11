@@ -24,12 +24,14 @@ namespace Radiocity.Web
         private const int MaxColumns = 512;
 
         private readonly ISampleSource _source;
+        private readonly IQuadratureSource _quadrature;
         private readonly int _rate;
         private readonly int _fftSize;
         private readonly float[] _window;
         private readonly float[] _re;
         private readonly float[] _im;
         private readonly float[] _fftBuf;
+        private readonly float[] _fftBufQ;
         private int _fftFill;
 
         private readonly byte[][] _columns = new byte[MaxColumns][];
@@ -46,6 +48,7 @@ namespace Radiocity.Web
         public CaptureHub(ISampleSource source)
         {
             _source = source;
+            _quadrature = source as IQuadratureSource;
             _rate = source.SampleRate;
             _fftSize = PickFftSize(_rate);
 
@@ -53,11 +56,25 @@ namespace Radiocity.Web
             _re = new float[_fftSize];
             _im = new float[_fftSize];
             _fftBuf = new float[_fftSize];
+            _fftBufQ = new float[_fftSize];
 
             for (int i = 0; i < MaxColumns; i++) _columns[i] = new byte[Bins];
         }
 
         public int SampleRate { get { return _rate; } }
+
+        /// <summary>True when the source delivers I/Q from a quadrature detector.</summary>
+        public bool IsQuadrature { get { return _quadrature != null; } }
+
+        /// <summary>
+        /// Lowest frequency the receiver can see. Zero for a real source, whose
+        /// band is 0..rate/2; minus rate/2 for a quadrature source, whose band is
+        /// centred on the local oscillator.
+        /// </summary>
+        public double BandLo { get { return _quadrature != null ? -_rate / 2.0 : 0.0; } }
+
+        /// <summary>Highest frequency the receiver can see.</summary>
+        public double BandHi { get { return _rate / 2.0; } }
         public long ColumnsTotal { get { lock (_columnsLock) return _columnsTotal; } }
 
         public int SessionCount
@@ -139,18 +156,29 @@ namespace Radiocity.Web
         private void Run()
         {
             float[] block = new float[32768];
+            float[] blockQ = new float[32768];
 
             while (_running)
             {
-                int n = _source.Read(block, 0, block.Length);
-                if (n <= 0) { Thread.Sleep(2); continue; }
+                int n;
 
-                PumpSpectrum(block, n);
+                if (_quadrature != null)
+                {
+                    n = _quadrature.ReadQuadrature(block, blockQ, block.Length);
+                    if (n <= 0) { Thread.Sleep(2); continue; }
+                }
+                else
+                {
+                    n = _source.Read(block, 0, block.Length);
+                    if (n <= 0) { Thread.Sleep(2); continue; }
+                }
+
+                PumpSpectrum(block, blockQ, n);
 
                 lock (_sessionsLock)
                 {
                     for (int i = 0; i < _sessions.Count; i++)
-                        _sessions[i].Feed(block, n);
+                        _sessions[i].Feed(block, blockQ, n);
                 }
             }
         }
@@ -160,14 +188,17 @@ namespace Radiocity.Web
         /// delivers a few hundred samples at a time, so "take the last N of the
         /// block" would either read garbage or never fire at all.
         /// </summary>
-        private void PumpSpectrum(float[] block, int n)
+        private void PumpSpectrum(float[] block, float[] blockQ, int n)
         {
             int offset = 0;
 
             while (offset < n)
             {
                 int take = Math.Min(_fftSize - _fftFill, n - offset);
+
                 Array.Copy(block, offset, _fftBuf, _fftFill, take);
+                if (_quadrature != null) Array.Copy(blockQ, offset, _fftBufQ, _fftFill, take);
+
                 _fftFill += take;
                 offset += take;
 
@@ -184,36 +215,53 @@ namespace Radiocity.Web
             for (int i = 0; i < _fftSize; i++)
             {
                 _re[i] = _fftBuf[i] * _window[i];
-                _im[i] = 0.0f;
+                _im[i] = _quadrature != null ? _fftBufQ[i] * _window[i] : 0.0f;
             }
 
             Fft.Forward(_re, _im);
 
             byte[] column = new byte[Bins];
-            int usable = _fftSize / 2;
-            int perBin = Math.Max(1, usable / Bins);
 
-            for (int b = 0; b < Bins; b++)
+            if (_quadrature != null)
             {
-                double peak = 0.0;
-                int from = b * perBin;
-                int to = Math.Min(usable, from + perBin);
+                // Complex spectrum: the whole FFT is meaningful, bins 0..N/2 are
+                // positive frequencies and N/2..N are negative ones. Reorder into
+                // -rate/2 .. +rate/2 so the display matches what you tune.
+                int perBin = Math.Max(1, _fftSize / Bins);
 
-                for (int i = from; i < to; i++)
+                for (int b = 0; b < Bins; b++)
                 {
-                    double mag = _re[i] * (double)_re[i] + _im[i] * (double)_im[i];
-                    if (mag > peak) peak = mag;
+                    double peak = 0.0;
+
+                    for (int k = 0; k < perBin; k++)
+                    {
+                        int bin = (b * perBin + k + _fftSize / 2) % _fftSize;
+                        double mag = _re[bin] * (double)_re[bin] + _im[bin] * (double)_im[bin];
+                        if (mag > peak) peak = mag;
+                    }
+
+                    column[b] = ToByte(peak);
                 }
+            }
+            else
+            {
+                int usable = _fftSize / 2;
+                int perBin = Math.Max(1, usable / Bins);
 
-                double amp = Math.Sqrt(peak) * 4.0 / _fftSize;
-                double db = 20.0 * Math.Log10(Math.Max(amp, 1e-12));
+                for (int b = 0; b < Bins; b++)
+                {
+                    double peak = 0.0;
+                    int from = b * perBin;
+                    int to = Math.Min(usable, from + perBin);
 
-                // Fixed scale: -110 dBFS at the bottom, -20 at the top, so a
-                // receiver's numbers stay comparable between sessions.
-                int v = (int)((db + 110.0) / 90.0 * 255.0);
-                if (v < 0) v = 0;
-                if (v > 255) v = 255;
-                column[b] = (byte)v;
+                    for (int i = from; i < to; i++)
+                    {
+                        double mag = _re[i] * (double)_re[i] + _im[i] * (double)_im[i];
+                        if (mag > peak) peak = mag;
+                    }
+
+                    column[b] = ToByte(peak);
+                }
             }
 
             lock (_columnsLock)
@@ -221,6 +269,21 @@ namespace Radiocity.Web
                 _columns[(int)(_columnsTotal % MaxColumns)] = column;
                 _columnsTotal++;
             }
+        }
+
+        /// <summary>
+        /// Fixed scale: -110 dBFS at the bottom, -20 at the top, so a receiver's
+        /// numbers stay comparable between sessions and between runs.
+        /// </summary>
+        private byte ToByte(double power)
+        {
+            double amp = Math.Sqrt(power) * 4.0 / _fftSize;
+            double db = 20.0 * Math.Log10(Math.Max(amp, 1e-12));
+
+            int v = (int)((db + 110.0) / 90.0 * 255.0);
+            if (v < 0) v = 0;
+            if (v > 255) v = 255;
+            return (byte)v;
         }
 
         /// <summary>

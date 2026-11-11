@@ -267,6 +267,8 @@
 
   var nextFrom = 0;
   var rate = 24000;
+  var bandLo = 0;
+  var bandHi = 24000;
   var state = { freq: 0, mode: "AM", channel: 9000 };
   var polling = true;
 
@@ -316,7 +318,16 @@
         var next = res.headers.get("X-Next-From");
         var bins = parseInt(res.headers.get("X-Bins") || "256", 10);
         var r = parseInt(res.headers.get("X-Rate") || "24000", 10);
-        if (r && r !== rate) { rate = r; updateAxis(); }
+        var lo = res.headers.get("X-Band-Lo");
+        var hi = res.headers.get("X-Band-Hi");
+
+        if (r && r !== rate) rate = r;
+        if (lo !== null && hi !== null) {
+          var nlo = parseInt(lo, 10), nhi = parseInt(hi, 10);
+          if (nlo !== bandLo || nhi !== bandHi) { bandLo = nlo; bandHi = nhi; }
+        }
+        updateAxis();
+
         if (bins !== BINS) BINS = bins;
         return res.arrayBuffer().then(function (buf) {
           var bytes = new Uint8Array(buf);
@@ -334,13 +345,13 @@
   }
 
   function updateAxis() {
-    var half = rate / 2;
     for (var i = 0; i <= 8; i++) {
       var el = document.getElementById("ax" + i);
-      if (el) el.textContent = Math.round(half * i / 8).toLocaleString();
+      if (el) el.textContent = Math.round(bandLo + (bandHi - bandLo) * i / 8).toLocaleString();
     }
     var range = document.getElementById("freqRange");
-    range.max = half;
+    range.min = bandLo;
+    range.max = bandHi;
   }
 
   // ---------------------------------------------------------------- tuning
@@ -349,7 +360,7 @@
   var pendingFreq = null;
 
   function tuneTo(hz, immediate) {
-    hz = Math.max(0, Math.min(rate / 2 - 500, Math.round(hz)));
+    hz = Math.max(bandLo, Math.min(bandHi - 500, Math.round(hz)));
     state.freq = hz;
     document.getElementById("freq").innerHTML = hz.toLocaleString() + " <small>Hz</small>";
     document.getElementById("freqOut").textContent = hz.toLocaleString();
@@ -393,7 +404,13 @@
   function applyState(s) {
     if (!s) return;
     if (s.sid && !sid) sid = s.sid;
-    if (s.rate) { rate = s.rate; updateAxis(); }
+    if (s.rate) rate = s.rate;
+    if (typeof s.bandLo === "number" && typeof s.bandHi === "number") {
+      if (s.bandLo !== bandLo || s.bandHi !== bandHi) {
+        bandLo = s.bandLo; bandHi = s.bandHi;
+      }
+    }
+    updateAxis();
     if (typeof s.level === "number") updateLevel(s.level);
 
     var badge = document.getElementById("squelchBadge");
@@ -423,7 +440,7 @@
   canvas.addEventListener("click", function (e) {
     var rect = canvas.getBoundingClientRect();
     var frac = (e.clientX - rect.left) / rect.width;
-    tuneTo(frac * (rate / 2), true);
+    tuneTo(bandLo + frac * (bandHi - bandLo), true);
   });
 
   document.getElementById("freqRange").addEventListener("input", function () {

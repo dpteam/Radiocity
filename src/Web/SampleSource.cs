@@ -23,6 +23,20 @@ namespace Radiocity.Web
         void Stop();
     }
 
+    /// <summary>
+    /// A source that delivers complex baseband: I and Q from a quadrature
+    /// detector, rather than a real signal that still needs mixing down.
+    ///
+    /// The distinction runs through the whole receiver: a real source needs the
+    /// NCO and sees 0..rate/2, a quadrature source needs no NCO and sees the
+    /// full complex band -rate/2..+rate/2 around the local oscillator.
+    /// </summary>
+    public interface IQuadratureSource : ISampleSource
+    {
+        /// <summary>Fills dstI/dstQ with up to frames samples each. Returns frames read.</summary>
+        int ReadQuadrature(float[] dstI, float[] dstQ, int frames);
+    }
+
     /// <summary>Real hardware through winmm.</summary>
     public sealed class WaveInSource : ISampleSource
     {

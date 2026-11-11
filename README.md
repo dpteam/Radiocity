@@ -26,6 +26,7 @@ decim   : 192k -> 12k in 2 stages, 4.6x cheaper than one filter
 squelch : mutes on silence, opens on carrier
 blanker : 8.2x less impulse error, tone kept within 1%
 I/Q     : float32 bit-exact round trip, centre frequency preserved
+image   : -31.2 dB before correction, -80.2 dB after (blind, 2% / 3 deg)
 web     : independent tuning, two sessions verified at 3 kHz and 18 kHz
 DCF77   : full telegram decoded at -40 and -20 dBFS
 ```
@@ -47,14 +48,22 @@ Windows. `build.cmd` and you are done.
 
 ## What this is not
 
-**It cannot receive broadcast FM at 87.5 MHz.** Not "with effort" — not at all.
-A 192 kHz codec samples 0–96 kHz; 87.5 MHz is 900× above that. No demodulator
-recovers information the samples never contained.
+**A bare sound card cannot receive broadcast FM at 87.5 MHz.** Not "with effort"
+— not at all. A 192 kHz codec samples 0–96 kHz; 87.5 MHz is 900× above that. No
+demodulator recovers information the samples never contained.
 
 What it *does* receive on a bare wire is **VLF/LF**: time signals, navigation
 beacons, sferics, whistlers. See [docs/THEORY.md](docs/THEORY.md) for the
 numbers and [docs/HARDWARE.md](docs/HARDWARE.md) for what to add when you want
 more than a wire.
+
+**With a quadrature downconverter in front of it, FM becomes possible** — and
+that path is implemented (`radiocity web --iq`). A SoftRock-style front end
+presents I and Q on the two channels, so a 192 kHz card becomes a 192 kHz-wide
+*complex* digitiser: ±96 kHz around the local oscillator instead of 0–96 kHz.
+A broadcast FM station is about 180–200 kHz wide (Carson's rule for ±75 kHz
+deviation), so it just fits. That is the whole reason the stereo capture path
+and the I/Q imbalance correction exist.
 
 ## Quick start
 
@@ -87,6 +96,7 @@ bin\Radiocity.exe dcf77 70 192000 -b24 rem decode the 77.5 kHz time signal
 | `calib <refHz> [sec] [rate]` | Measure the card's clock error in ppm |
 | `dcf77 [sec] [rate]` | Decode the DCF77 time signal at 77.5 kHz |
 | `web [--sim] [--port N]` | Serve the WebSDR UI (waterfall, audio, tuning) |
+| `web --iq` / `web --sim-iq` | Same, fed from a quadrature front end (I/Q on two channels) |
 | `iq record <file> <freqHz> [sec]` | Record baseband I/Q for offline analysis |
 | `iq demod <file> <out.wav> [mode]` | Demodulate a recording — try any mode on the same capture |
 | `iq info <file>` | Show what a recording contains |
@@ -139,7 +149,8 @@ affordable on a 2005 CPU.
 | Squelch | `src/Dsp/Squelch.cs` | Hysteresis on channel power, measured before the AGC |
 | Blanker | `src/Dsp/NoiseBlanker.cs` | Impulse detection on the baseband, before the channel filter smears the click |
 | I/Q file | `src/Dsp/IqFile.cs` | Stereo WAV, float32, centre frequency in a RIFF comment |
-| Resampling | `src/Dsp/Demod.cs` | Catmull-Rom; linear interpolation would droop 3.3 dB at 5 kHz |
+| Quadrature | `src/Web/QuadratureSource.cs` | A SoftRock-style front end: L = I, R = Q, full complex band |
+| Imbalance | `src/Dsp/IqImbalance.cs` | Blind Gram-Schmidt correction, no calibration signal needed || Resampling | `src/Dsp/Demod.cs` | Catmull-Rom; linear interpolation would droop 3.3 dB at 5 kHz |
 | Clock | `src/Dsp/ClockCalib.cs` | FFT peak + parabolic refinement + Goertzel sweep, under 1 ppm |
 | DCF77 | `src/Dsp/Dcf77.cs` | 100/200 ms dip widths, BCD telegram, three parity bits |
 | Web | `src/Web/` | `TcpListener` + hand-rolled HTTP/1.1; one capture, one receiver per listener |
@@ -161,6 +172,7 @@ Full explanation in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | Squelch | mutes at 0.6 s, opens at 1.6 s, mutes at 2.6 s | follows the signal, not the block |
 | Blanker | 8× less error, tone within 1% | removes the clicks, not the signal |
 | I/Q file | float32 bit-exact, int16 within half an LSB | metadata survives the round trip |
+| Imbalance | image from −31 dB to −80 dB | blind correction must not need a calibration signal |
 | Resampler | amplitude within 2%, > 30 dB | a bad interpolator is audible as dullness |
 | DCF77 | full frame at −40 and −20 dBFS | the second one is a noisy city, not a lab |
 
@@ -227,15 +239,51 @@ docs/HARDWARE.md             antennas and downconverters, by budget
 Working: capture and playback, AM, FM, USB, LSB, CW, AGC, squelch, impulse
 blanker, spectrum, offline demodulation, clock calibration, DCF77 decoding,
 8/16/24/32-bit capture, multi-stage decimation, I/Q recording, a **WebSDR front
-end**, and **independent tuning for every listener**.
+end**, **independent tuning for every listener**, and a **quadrature front end
+path** with blind I/Q imbalance correction.
 
 Not yet:
 
 - [ ] RSDN-20 and SAQ decoders.
-- [ ] Stereo capture, so a quadrature downconverter's I/Q can be recorded
-      directly instead of being synthesised by the mixer.
-- [ ] Password or rate limiting on the web server. It is a receiver for a
+- [ ] Stereo FM decoding (the pilot tone and the 38 kHz subcarrier). Mono FM
+      works; stereo needs a subcarrier PLL and a stereo matrix.
+- [ ] Password and rate limiting on the web server. It is a receiver for a
       trusted network, not a public service.
+
+## Quadrature front end
+
+```cmd
+bin\Radiocity.exe web --sim-iq          rem simulate a SoftRock, 2% / 3 deg
+bin\Radiocity.exe web --iq --rate 192000 -b24
+```
+
+`--iq` opens the sound card as **stereo**, left channel I, right channel Q. The
+receiver then treats the card as a 192 kHz-wide complex digitiser centred on the
+local oscillator, so the tuning range is −96 … +96 kHz instead of 0 … 96 kHz.
+The waterfall switches to a signed axis to match.
+
+Two things this changes:
+
+- **The NCO is still needed.** It is a common misconception that a quadrature
+  front end removes it. The hardware mixes the wanted *band* down to DC; a
+  station still sits somewhere inside that band, and selecting it is software's
+  job. What the hardware removes is the *image*, not the tuning.
+- **A real front end has an imbalance.** The two analogue paths never match
+  exactly, so a carrier at +f leaks into −f. With 2% gain error and 3° of phase
+  error the image sits at about −31 dB, which is audible as a ghost station
+  mirroring every signal. `IqImbalance` measures and corrects it blind —
+  no calibration signal, no factory trim — and takes it to −80 dB:
+
+```
+injected 2.0% gain error, 3.0 deg phase error
+measured 2.01% gain, 2.99 deg phase
+image before : -31.2 dB
+image after  : -80.2 dB
+```
+
+The correction is the identity transform on a perfectly balanced signal, which
+is why it is safe to leave enabled. `--no-imbalance` turns it off if you want to
+see the ghost.
 
 ## Many listeners, one sound card
 

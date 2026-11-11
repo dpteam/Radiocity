@@ -8,8 +8,39 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Planned
 - RSDN-20 and SAQ decoders
-- Stereo capture, so a downconverter's I/Q can be recorded directly
+- Stereo FM decoding (pilot tone and 38 kHz subcarrier)
 - Optional password and rate limiting for the web server
+
+## [0.8.0] - 2026-11-12
+
+### Added
+- **Quadrature front end** (`radiocity web --iq`) — the sound card is opened as
+  stereo, I in the left channel and Q in the right, exactly what a SoftRock-style
+  downconverter produces. The receiver then sees the full complex band
+  −rate/2 … +rate/2 around the local oscillator instead of 0 … rate/2.
+- **`IqImbalance`** — blind Gram-Schmidt correction of gain and phase mismatch,
+  measured from the signal statistics with no calibration signal. Takes the
+  image from −31 dB to −80 dB for a 2% / 3° front end.
+- `Receiver.ProcessComplex` — demodulation of complex input that still needs the
+  NCO, as opposed to `ProcessBaseband` for recordings that are already centred.
+- `SyntheticQuadratureSource` and `--sim-iq`: a simulated SoftRock *with* an
+  imbalance, so the correction has something real to fix in tests and demos.
+- Waterfall and `/state` now report `quadrature`, `bandLo` and `bandHi`; the UI
+  draws a signed axis and maps clicks onto it.
+- Quadrature integration test in CI, separate from the real-source one.
+
+### Changed
+- Frequency clamping uses the source's actual band rather than assuming 0..rate/2.
+
+### Fixed
+- **Tuning did nothing in quadrature mode.** I had assumed a quadrature front
+  end removes the need for the NCO. It does not: the hardware mixes the wanted
+  *band* down to DC, but a station still sits somewhere inside that band, so
+  software still has to select it. Every frequency sounded identical until
+  `ProcessComplex` put the NCO back in front of the demodulator.
+- Imbalance correction moved ahead of the mixer. It is a real 2x2 matrix and does
+  not commute with the complex rotation of the NCO, so correcting after mixing
+  would leave a residual image.
 
 ## [0.7.0] - 2026-11-12
 

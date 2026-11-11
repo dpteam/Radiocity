@@ -117,6 +117,7 @@ namespace Radiocity.App
             Console.WriteLine("  radiocity dcf77 [seconds] [rate]        decode the 77.5 kHz time signal");
             Console.WriteLine("  radiocity web [--sim] [--port N] [--rate N] [--freq N] [--mode M]");
             Console.WriteLine("                                          serve a WebSDR UI on http://localhost:8080");
+            Console.WriteLine("       add --iq for a quadrature front end (L=I, R=Q) or --sim-iq to simulate one.");
             Console.WriteLine("  radiocity iq record <file> <freqHz> [sec] [rate] [decim]");
             Console.WriteLine("                                          record baseband I/Q for offline analysis");
             Console.WriteLine("  radiocity iq demod <file> <out.wav> [mode]");
@@ -158,6 +159,8 @@ namespace Radiocity.App
             ok &= RunBlankerTest();
             Console.WriteLine();
             ok &= RunIqTest();
+            Console.WriteLine();
+            ok &= RunImbalanceTest();
             Console.WriteLine();
             ok &= RunResamplerTest();
             Console.WriteLine();
@@ -628,6 +631,88 @@ namespace Radiocity.App
             bool ok = !at07 && at17 && !at27;
             Console.WriteLine(ok ? "  PASS" : "  FAIL: gate did not follow the signal");
             return ok;
+        }
+
+        private static bool RunImbalanceTest()
+        {
+            // A real quadrature front end has two analogue paths that are never
+            // identical. The result is an image: a carrier at +f leaks into -f.
+            // This injects a known imbalance, measures the image, and checks that
+            // the blind correction removes it without being told what it was.
+            const double rate = 12000.0;
+            const double tone = 1500.0;
+            const double amplitude = 0.4;
+            const double gainError = 0.02;          // 2% = 0.17 dB
+            const double phaseErrorDeg = 3.0;
+            int n = (int)(rate * 4.0);
+
+            double phi = phaseErrorDeg * Math.PI / 180.0;
+            float[] rawI = new float[n];
+            float[] rawQ = new float[n];
+
+            for (int k = 0; k < n; k++)
+            {
+                double phase = 2.0 * Math.PI * tone * k / rate;
+                double i = amplitude * Math.Cos(phase);
+                double q = amplitude * Math.Sin(phase);
+
+                rawI[k] = (float)i;
+                rawQ[k] = (float)(q * (1.0 + gainError) * Math.Cos(phi) + i * Math.Sin(phi));
+            }
+
+            double wantedBefore = ImageLevel(rawI, rawQ, n, rate, tone);
+            double imageBefore = ImageLevel(rawI, rawQ, n, rate, -tone);
+
+            float[] fixedI = (float[])rawI.Clone();
+            float[] fixedQ = (float[])rawQ.Clone();
+
+            IqImbalance corr = new IqImbalance(rate);
+            corr.Process(fixedI, fixedQ, n);
+
+            double wantedAfter = ImageLevel(fixedI, fixedQ, n, rate, tone);
+            double imageAfter = ImageLevel(fixedI, fixedQ, n, rate, -tone);
+
+            double beforeDb = Db(imageBefore / Math.Max(wantedBefore, 1e-12));
+            double afterDb = Db(imageAfter / Math.Max(wantedAfter, 1e-12));
+
+            Console.WriteLine("I/Q imbalance self-test");
+            Console.WriteLine("  injected " + (gainError * 100.0).ToString("F1", Inv) + "% gain error, " +
+                              phaseErrorDeg.ToString("F1", Inv) + " deg phase error");
+            Console.WriteLine("  measured " + (corr.GainRatio * 100.0 - 100.0).ToString("F2", Inv) + "% gain, " +
+                              corr.PhaseErrorDeg.ToString("F2", Inv) + " deg phase");
+            Console.WriteLine("  image before : " + beforeDb.ToString("F1", Inv) + " dB");
+            Console.WriteLine("  image after  : " + afterDb.ToString("F1", Inv) + " dB");
+            Console.WriteLine("  improvement  : " + (beforeDb - afterDb).ToString("F1", Inv) + " dB");
+
+            // 2% and 3 degrees should give roughly -35 dB of image; after
+            // correction it should be far below that.
+            bool ok = beforeDb > -45.0 && beforeDb < -25.0 && afterDb < -60.0 &&
+                      Math.Abs(corr.GainRatio - (1.0 + gainError)) < 0.005;
+
+            Console.WriteLine(ok ? "  PASS" : "  FAIL: correction did not remove the image");
+            return ok;
+        }
+
+        /// <summary>
+        /// Magnitude of the component at hz, measured over the second half so the
+        /// statistics have settled. Used to compare a wanted tone with its image.
+        /// </summary>
+        private static double ImageLevel(float[] i, float[] q, int n, double rate, double hz)
+        {
+            int offset = n / 2;
+            int count = n - offset;
+
+            double re = 0.0, im = 0.0;
+            for (int k = 0; k < count; k++)
+            {
+                double phase = -2.0 * Math.PI * hz * (offset + k) / rate;
+                double c = Math.Cos(phase);
+                double s = Math.Sin(phase);
+                re += i[offset + k] * c - q[offset + k] * s;
+                im += i[offset + k] * s + q[offset + k] * c;
+            }
+
+            return 2.0 * Math.Sqrt(re * re + im * im) / count;
         }
 
         private static bool RunResamplerTest()
@@ -1133,6 +1218,9 @@ namespace Radiocity.App
         private static int WebServe(string[] args)
         {
             bool simulated = false;
+            bool quadrature = false;
+            bool simulatedQuadrature = false;
+            bool correctImbalance = true;
             int port = 8080;
             int rate = 48000;
             double freq = 12000.0;
@@ -1144,6 +1232,9 @@ namespace Radiocity.App
                 string a = args[i].ToLowerInvariant();
 
                 if (a == "--sim") simulated = true;
+                else if (a == "--iq") quadrature = true;
+                else if (a == "--sim-iq") simulatedQuadrature = true;
+                else if (a == "--no-imbalance") correctImbalance = false;
                 else if (a == "--port" && i + 1 < args.Length) port = int.Parse(args[++i], Inv);
                 else if (a == "--rate" && i + 1 < args.Length) rate = int.Parse(args[++i], Inv);
                 else if (a == "--freq" && i + 1 < args.Length) freq = double.Parse(args[++i], Inv);
@@ -1153,7 +1244,30 @@ namespace Radiocity.App
             }
 
             ISampleSource source;
-            if (simulated)
+
+            if (simulatedQuadrature)
+            {
+                // 2% gain error and 3 degrees of phase error: a plausible
+                // SoftRock, and enough that the image is audible without
+                // correction.
+                source = new SyntheticQuadratureSource(rate, 0.02, 3.0);
+                Console.WriteLine("source: " + source.Description + " (no hardware needed)");
+            }
+            else if (quadrature)
+            {
+                try
+                {
+                    source = new QuadratureSource(rate, bits);
+                    Console.WriteLine("source: " + source.Description);
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine("cannot open the sound card: " + ex.Message);
+                    Console.Error.WriteLine("try:  radiocity web --sim-iq     (synthetic quadrature)");
+                    return 1;
+                }
+            }
+            else if (simulated)
             {
                 source = new SyntheticSource(rate);
                 Console.WriteLine("source: " + source.Description + " (no sound card needed)");
@@ -1173,7 +1287,7 @@ namespace Radiocity.App
                 }
             }
 
-            using (WebRadio radio = new WebRadio(source, freq, mode, DefaultChannel(mode)))
+            using (WebRadio radio = new WebRadio(source, freq, mode, DefaultChannel(mode), correctImbalance))
             using (HttpServer server = new HttpServer(port, radio.Handle))
             {
                 if (BlankerThreshold.HasValue) radio.SetBlanker(BlankerThreshold);
@@ -1185,7 +1299,10 @@ namespace Radiocity.App
                 Console.WriteLine();
                 Console.WriteLine("  Radiocity " + Version + " listening on http://localhost:" + port + "/");
                 Console.WriteLine("  tuned to " + freq.ToString("F0", Inv) + " Hz, " + radio.Mode +
-                                  ", band 0.." + (rate / 2).ToString("F0", Inv) + " Hz");
+                                  ", band " + (radio.IsQuadrature ? "-" : "") +
+                                  (rate / 2).ToString("F0", Inv) + " .. " + (rate / 2).ToString("F0", Inv) + " Hz" +
+                                  (radio.IsQuadrature ? " around the LO" : ""));
+                if (radio.IsQuadrature && correctImbalance) Console.WriteLine("  I/Q imbalance correction: on");
                 Console.WriteLine("  press Ctrl+C to stop");
                 Console.WriteLine();
 

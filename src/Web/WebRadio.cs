@@ -35,23 +35,34 @@ namespace Radiocity.Web
         private readonly double _initialFreq;
         private readonly DemodMode _initialMode;
         private readonly double _initialChannel;
+        private readonly bool _correctImbalance;
         private float? _initialBlanker;
 
         private Timer _reaper;
         private bool _disposed;
 
         public WebRadio(ISampleSource source, double initialFreq, DemodMode mode, double channelHz)
+            : this(source, initialFreq, mode, channelHz, false)
+        {
+        }
+
+        public WebRadio(ISampleSource source, double initialFreq, DemodMode mode, double channelHz,
+                        bool correctImbalance)
         {
             _hub = new CaptureHub(source);
 
             _initialFreq = initialFreq;
             _initialMode = mode;
             _initialChannel = channelHz;
+            _correctImbalance = correctImbalance;
 
             // The default session exists from the start, so /state answers
             // immediately and the console banner can report real settings.
             GetOrCreate(DefaultSessionId);
         }
+
+        /// <summary>True when the source is a quadrature front end.</summary>
+        public bool IsQuadrature { get { return _hub.IsQuadrature; } }
 
         public int SampleRate { get { return _hub.SampleRate; } }
 
@@ -111,7 +122,8 @@ namespace Radiocity.Web
                     throw new SessionLimitException(MaxSessions);
                 }
 
-                RadioSession session = new RadioSession(_hub, id, _initialFreq, _initialMode, _initialChannel);
+                RadioSession session = new RadioSession(_hub, id, _initialFreq, _initialMode, _initialChannel,
+                                                        _correctImbalance);
                 session.Configure(_initialMode, _initialChannel, null, _initialBlanker);
                 _sessions[id] = session;
                 return session;
@@ -193,6 +205,8 @@ namespace Radiocity.Web
             r.Headers["X-Next-From"] = next.ToString(CultureInfo.InvariantCulture);
             r.Headers["X-Bins"] = CaptureHub.Bins.ToString(CultureInfo.InvariantCulture);
             r.Headers["X-Rate"] = _hub.SampleRate.ToString(CultureInfo.InvariantCulture);
+            r.Headers["X-Band-Lo"] = _hub.BandLo.ToString("F0", CultureInfo.InvariantCulture);
+            r.Headers["X-Band-Hi"] = _hub.BandHi.ToString("F0", CultureInfo.InvariantCulture);
             return r;
         }
 
@@ -221,6 +235,9 @@ namespace Radiocity.Web
                 : "0").Append(',');
 
             sb.Append("\"sessions\":").Append(SessionCount).Append(',');
+            sb.Append("\"quadrature\":").Append(_hub.IsQuadrature ? "true" : "false").Append(',');
+            sb.Append("\"bandLo\":").Append(_hub.BandLo.ToString("F0", CultureInfo.InvariantCulture)).Append(',');
+            sb.Append("\"bandHi\":").Append(_hub.BandHi.ToString("F0", CultureInfo.InvariantCulture)).Append(',');
             sb.Append("\"columns\":").Append(_hub.ColumnsTotal);
             sb.Append('}');
 
@@ -269,10 +286,13 @@ namespace Radiocity.Web
                     blanker = (bv > 0.0f) ? (float?)bv : null;
             }
 
-            // Clamp inside what the card can actually see.
-            double limit = _hub.SampleRate * 0.5 - 500.0;
-            if (freq < 0.0) freq = 0.0;
-            if (freq > limit) freq = limit;
+            // Clamp inside what the receiver can actually see. For a real source
+            // that is 0..rate/2; for a quadrature front end it is the full
+            // complex band around the local oscillator.
+            double lo = _hub.BandLo + 500.0;
+            double hi = _hub.BandHi - 500.0;
+            if (freq < lo) freq = lo;
+            if (freq > hi) freq = hi;
 
             bool needsRebuild = (mode != s.Mode) || Math.Abs(channel - s.ChannelHz) > 1.0 ||
                                 !Nullable.Equals(squelch, s.SquelchDb) ||

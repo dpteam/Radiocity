@@ -48,6 +48,13 @@ namespace Radiocity.Dsp
         /// </summary>
         public float? BlankerThreshold;
 
+        /// <summary>
+        /// Correct I/Q gain and phase imbalance (Gram-Schmidt). Only meaningful
+        /// for a real quadrature front end; on synthesised I/Q the correction is
+        /// the identity transform, so leaving it off is also correct.
+        /// </summary>
+        public bool CorrectImbalance;
+
         public ReceiverOptions()
         {
             Mode = DemodMode.Am;
@@ -60,6 +67,7 @@ namespace Radiocity.Dsp
             AgcEnabled = true;
             SquelchDb = null;
             BlankerThreshold = null;
+            CorrectImbalance = false;
         }
 
         public static ReceiverOptions Am(int decimation)
@@ -122,6 +130,7 @@ namespace Radiocity.Dsp
         private readonly Agc _agc;
         private readonly Squelch _squelch;
         private readonly NoiseBlanker _blanker;
+        private readonly IqImbalance _imbalance;
         private readonly DemodMode _mode;
         private readonly bool _agcEnabled;
 
@@ -196,6 +205,8 @@ namespace Radiocity.Dsp
                 _blanker.Threshold = options.BlankerThreshold.Value;
             }
 
+            if (options.CorrectImbalance) _imbalance = new IqImbalance(OutputRate);
+
             int block = 32768;
             _i = new float[block];
             _q = new float[block];
@@ -224,6 +235,12 @@ namespace Radiocity.Dsp
         /// <summary>Channel power in dBFS, for meters and the web UI.</summary>
         public float LevelDb { get { return _levelDb; } }
 
+        /// <summary>
+        /// Measured I/Q imbalance, when correction is enabled: gain ratio,
+        /// phase error and the image rejection it implies.
+        /// </summary>
+        public IqImbalance Imbalance { get { return _imbalance; } }
+
         /// <summary>Safe to call from any thread; takes effect at the next block.</summary>
         public void SetTune(double hz)
         {
@@ -247,6 +264,36 @@ namespace Radiocity.Dsp
         }
 
         /// <summary>
+        /// Demodulates complex input that still needs tuning, i.e. I/Q from a
+        /// quadrature front end.
+        ///
+        /// This is not the same as ProcessBaseband. A quadrature detector mixes
+        /// the wanted band down to DC, but that band is up to 192 kHz wide and a
+        /// station sits somewhere inside it — so the NCO is still needed to select
+        /// one. What the hardware removes is the *image*, not the tuning.
+        /// </summary>
+        public int ProcessComplex(float[] i, float[] q, int n, float[] output)
+        {
+            if (n > _bi.Length) throw new ArgumentOutOfRangeException("n");
+
+            // Imbalance is a property of the hardware, so it is corrected on the
+            // raw I/Q before anything else touches it. Correcting after the mixer
+            // would be wrong: the correction is a real 2x2 matrix, and it does not
+            // commute with the complex rotation of the NCO.
+            if (_imbalance != null) _imbalance.Process(i, q, n);
+
+            int tune = _pendingTuneHz;
+            if (tune != 0)
+            {
+                _nco.SetFrequency(tune, SampleRate);
+                _pendingTuneHz = 0;
+            }
+
+            _nco.MixComplexDown(i, q, _i, _q, n);
+            return Demodulate(_i, _q, n, output);
+        }
+
+        /// <summary>
         /// Demodulates an already-mixed complex baseband, skipping the NCO.
         /// This is what makes recorded I/Q replayable: the recording is the
         /// output of the mixer, so every demodulator can be tried against the
@@ -255,6 +302,7 @@ namespace Radiocity.Dsp
         public int ProcessBaseband(float[] i, float[] q, int n, float[] output)
         {
             if (n > _bi.Length) throw new ArgumentOutOfRangeException("n");
+            if (_imbalance != null) _imbalance.Process(i, q, n);
             return Demodulate(i, q, n, output);
         }
 

@@ -74,8 +74,20 @@ The classic sound-card SDR design (SoftRock) uses:
   behind every sound-card SDR
 
 With a 192 kHz card this gives ±96 kHz of visible bandwidth, which fits one
-broadcast FM station completely. That is the setup where `radiocity listen ...
-fm` finally makes sense.
+broadcast FM station completely. That is the setup where `radiocity web --iq`
+finally makes sense.
+
+**This is the path the software now supports.** `radiocity web --iq --rate 192000
+-b24` opens the card as stereo and treats it as a complex digitiser. Two things
+to expect from real hardware:
+
+- **The two channels will not match.** Expect 1–5% gain difference and a couple of
+  degrees of phase error, which puts an image 26–40 dB down. The receiver corrects
+  this automatically (`IqImbalance`); `--no-imbalance` turns it off so you can
+  hear what it is doing.
+- **A 90° phase split from a flip-flop is exact**, but the audio path afterwards
+  is not. Keep the two channels' cables the same length, and if the card has a
+  per-channel gain control, leave both at the same setting.
 
 Cost: the parts are cheap; the PCB and the soldering are the real expense.
 Kits exist (SoftRock Ensemble, and various Chinese clones).
@@ -103,7 +115,7 @@ RTL-TCP client would reuse everything else.
 |---|---|---|
 | Bare wire, 192 kHz | 0–96 kHz | DCF77 (maybe), sferics, whistlers |
 | Ferrite rod + cap, 192 kHz | 77.5 kHz | DCF77 reliably, every minute |
-| Downconverter, 192 kHz | one HF band at a time, ±96 kHz | AM broadcast, SSB amateurs, CW, utilities |
+| Downconverter, 192 kHz, `--iq` | ±96 kHz complex around the LO | AM broadcast, SSB amateurs, CW, utilities, **mono broadcast FM** |
 | RTL-SDR | 24 MHz–1.7 GHz | everything, but with different software |
 
 ## A reality check on noise

@@ -30,6 +30,9 @@ namespace Radiocity.Web
         private readonly List<AudioClient> _clients = new List<AudioClient>();
 
         private readonly RingBuffer _inRing = new RingBuffer(1 << 17);
+        private readonly RingBuffer _inRingQ = new RingBuffer(1 << 17);
+        private readonly bool _quadrature;
+        private readonly bool _correctImbalance;
 
         private double _freq;
         private DemodMode _mode;
@@ -45,11 +48,14 @@ namespace Radiocity.Web
         private long _lastAccessTicks;
         private bool _disposed;
 
-        internal RadioSession(CaptureHub hub, string id, double freq, DemodMode mode, double channelHz)
+        internal RadioSession(CaptureHub hub, string id, double freq, DemodMode mode, double channelHz,
+                              bool correctImbalance)
         {
             _hub = hub;
             _id = id;
             _rate = hub.SampleRate;
+            _quadrature = hub.IsQuadrature;
+            _correctImbalance = correctImbalance;
 
             _freq = freq;
             _mode = mode;
@@ -187,12 +193,18 @@ namespace Radiocity.Web
         /// that cannot keep up loses its oldest samples rather than stalling
         /// everyone else's receiver.
         /// </summary>
-        internal void Feed(float[] block, int n)
+        internal void Feed(float[] block, float[] blockQ, int n)
         {
             if (!_running) return;
 
             if (_inRing.Free < n) _inRing.Clear();
             _inRing.Write(block, 0, n);
+
+            if (_quadrature)
+            {
+                if (_inRingQ.Free < n) _inRingQ.Clear();
+                _inRingQ.Write(blockQ, 0, n);
+            }
         }
 
         private void EnsureRunning()
@@ -214,6 +226,7 @@ namespace Radiocity.Web
         private void Run()
         {
             float[] block = new float[32768];
+            float[] blockQ = new float[32768];
             float[] audio = new float[32768];
             float[] play = new float[32768 * 4 + 64];
 
@@ -247,6 +260,7 @@ namespace Radiocity.Web
                     options.ChannelHz = channel;
                     options.SquelchDb = squelch;
                     options.BlankerThreshold = blanker;
+                    options.CorrectImbalance = _quadrature && _correctImbalance;
                     if (mode == DemodMode.Fm)
                     {
                         options.DeviationHz = 75000.0;
@@ -274,9 +288,26 @@ namespace Radiocity.Web
                 int n = _inRing.Read(block, 0, block.Length);
                 if (n <= 0) { Thread.Sleep(2); continue; }
 
-                rx.SetTune(Frequency);
+                int m;
 
-                int m = rx.Process(block, n, audio);
+                if (_quadrature)
+                {
+                    // A quadrature front end already removed the image, but the
+                    // band it hands over is up to 192 kHz wide, so the NCO still
+                    // has to pick a station inside it.
+                    int nq = _inRingQ.Read(blockQ, 0, n);
+                    if (nq < n) n = nq;
+                    if (n <= 0) continue;
+
+                    rx.SetTune(Frequency);
+                    m = rx.ProcessComplex(block, blockQ, n, audio);
+                }
+                else
+                {
+                    rx.SetTune(Frequency);
+                    m = rx.Process(block, n, audio);
+                }
+
                 if (m <= 0) continue;
 
                 _levelDb = rx.LevelDb;

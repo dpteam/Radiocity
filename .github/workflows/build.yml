@@ -133,6 +133,11 @@ jobs:
             if ($a2.sessions -lt 3) { throw "expected at least 3 sessions, got $($a2.sessions)" }
             Write-Host "independent tuning: alpha=$($a2.freq) Hz, bravo=$($b2.freq) Hz, $($a2.sessions) sessions"
 
+            # A real source must report the band it can actually see.
+            if ($state.quadrature -ne $false) { throw "a real source should not report quadrature" }
+            if ($state.bandLo -ne 0) { throw "a real source should start at 0 Hz, got $($state.bandLo)" }
+            Write-Host "real source: band 0..$($state.bandHi) Hz"
+
             # Audio must actually stream PCM, not just answer 200. Read against a
             # time budget rather than an iteration count: chunked responses
             # arrive in whatever sizes the server flushed.
@@ -167,6 +172,73 @@ jobs:
           path: |
             web-test.log
             web-test.err
+          if-no-files-found: ignore
+
+      # The quadrature path is a different receiver: the band is centred on the
+      # local oscillator, negative frequencies are real, and the image has to be
+      # suppressed. Test it separately rather than assuming it shares code paths.
+      - name: Quadrature integration test
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Get-Process Radiocity -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+
+          $proc = Start-Process -FilePath "bin\Radiocity.exe" -ArgumentList "web","--sim-iq","--port","8098","--rate","48000" -PassThru -WindowStyle Hidden -RedirectStandardOutput "quad-test.log" -RedirectStandardError "quad-test.err"
+
+          try {
+            $ok = $false
+            for ($i = 0; $i -lt 60; $i++) {
+              Start-Sleep -Milliseconds 250
+              try {
+                $probe = New-Object System.Net.Sockets.TcpClient
+                $probe.Connect("127.0.0.1", 8098)
+                $probe.Close()
+                $ok = $true
+                break
+              } catch { }
+            }
+            if (-not $ok) { throw "quadrature server did not open port 8098" }
+
+            $state = $null
+            for ($i = 0; $i -lt 20; $i++) {
+              try { $state = Invoke-RestMethod "http://localhost:8098/state" -TimeoutSec 10; break } catch { Start-Sleep -Milliseconds 250 }
+            }
+            if ($null -eq $state) { throw "GET /state never answered" }
+
+            if ($state.quadrature -ne $true) { throw "quadrature source did not report quadrature" }
+            if ($state.bandLo -ne -24000) { throw "expected band to start at -24000, got $($state.bandLo)" }
+            Write-Host "band: $($state.bandLo)..$($state.bandHi) Hz around the LO"
+
+            # Tuning to a negative frequency must work, and must land there.
+            $neg = Invoke-RestMethod "http://localhost:8098/tune?sid=neg" -Method POST -Body "f=-12000&mode=am&bw=6000" -TimeoutSec 10
+            if ($neg.freq -ne -12000) { throw "negative tuning clamped to $($neg.freq)" }
+            Write-Host "negative tuning: $($neg.freq) Hz"
+
+            # The synthetic front end has a 2% gain error and 3 degrees of phase
+            # error, so the image at -12 kHz is real. Correction must suppress it.
+            Start-Sleep -Seconds 2
+            $image = (Invoke-RestMethod "http://localhost:8098/state?sid=neg" -TimeoutSec 10).level
+            $want = (Invoke-RestMethod "http://localhost:8098/tune?sid=want" -Method POST -Body "f=12000&mode=am&bw=6000" -TimeoutSec 10).level
+            Start-Sleep -Seconds 2
+            $want = (Invoke-RestMethod "http://localhost:8098/state?sid=want" -TimeoutSec 10).level
+
+            Write-Host "wanted +12 kHz: $want dBFS, image -12 kHz: $image dBFS"
+            if ($want -lt -30) { throw "wanted carrier is too weak: $want dBFS" }
+            if ($image -gt -40) { throw "image is not suppressed: $image dBFS" }
+          }
+          finally {
+            if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
+          }
+
+      - name: Upload quadrature test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quad-test-log
+          path: |
+            quad-test.log
+            quad-test.err
           if-no-files-found: ignore
 
       # The icon is generated, not hand-edited. Rather than compare bytes —

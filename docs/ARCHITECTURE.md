@@ -250,6 +250,45 @@ ten seconds of silence, so a closed tab cannot hold a pool thread forever.
 waterfall runs at about 25 columns per second at 48 kHz and at 192 kHz alike. A
 fixed 2048-point FFT would scroll four times too fast at 192 kHz.
 
+## Quadrature front end — `src/Web/QuadratureSource.cs`, `src/Dsp/IqImbalance.cs`
+
+A SoftRock-style downconverter mixes a band down to audio and presents it as two
+channels in quadrature. The card then becomes a 192 kHz-wide *complex*
+digitiser, and the receiver sees −96 … +96 kHz around the local oscillator
+instead of 0 … 96 kHz. That is the only configuration in which this software can
+receive broadcast FM, because a station is 180–200 kHz wide and needs the full
+complex band to fit.
+
+Two things are easy to get wrong here, and both were:
+
+**The NCO is still needed.** It is tempting to think a quadrature front end
+removes the mixer. It does not. The hardware mixes the wanted *band* down to DC;
+a station still sits somewhere inside that band, and selecting it is software's
+job. Without an NCO in front of the demodulator every frequency sounds the same,
+which is exactly what happened until `ProcessComplex` was added.
+
+**The imbalance must be corrected before the mixer.** A real front end has gain
+and phase mismatch between its two paths, which puts an image of every signal at
+the mirror frequency. The correction is a real 2×2 matrix on (I, Q), and a 2×2
+matrix does not commute with the complex rotation of the NCO — correcting after
+mixing leaves a residual image.
+
+The estimator is blind, because there is nothing to calibrate against:
+
+```
+rho = E[I*Q] / E[I^2]        correlation, caused by phase error
+q   = E[Q^2] / E[I^2]        power ratio, caused by gain error
+Q'  = (Q - rho*I) / sqrt(q - rho^2)
+```
+
+After that `E[I·Q'] = 0` and `E[Q'²] = E[I²]`, so the image is gone. On a
+balanced signal `rho = 0` and `q = 1`, which makes the whole thing the identity
+transform — the reason it can stay switched on for synthesised I/Q.
+
+Guards that matter: no correction until 64 samples of statistics have
+accumulated, and none when `E[I²]` or the determinant is near zero. Dividing by
+a vanishing determinant is how a silent channel turns into infinite gain.
+
 ## Performance notes
 
 Everything in `Process()` is preallocated. The whole AM chain at 48 kHz runs in
