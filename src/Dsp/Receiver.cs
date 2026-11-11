@@ -41,6 +41,13 @@ namespace Radiocity.Dsp
         /// <summary>Squelch threshold in dBFS of channel power; null disables it.</summary>
         public float? SquelchDb;
 
+        /// <summary>
+        /// Impulse blanker threshold as a multiple of the average power; null
+        /// disables it. 10-20 is a sensible range: too low starts eating the
+        /// signal, too high stops catching the clicks.
+        /// </summary>
+        public float? BlankerThreshold;
+
         public ReceiverOptions()
         {
             Mode = DemodMode.Am;
@@ -52,6 +59,7 @@ namespace Radiocity.Dsp
             SsbTaps = 127;
             AgcEnabled = true;
             SquelchDb = null;
+            BlankerThreshold = null;
         }
 
         public static ReceiverOptions Am(int decimation)
@@ -113,6 +121,7 @@ namespace Radiocity.Dsp
         private readonly SsbDemod _ssb;
         private readonly Agc _agc;
         private readonly Squelch _squelch;
+        private readonly NoiseBlanker _blanker;
         private readonly DemodMode _mode;
         private readonly bool _agcEnabled;
 
@@ -181,6 +190,12 @@ namespace Radiocity.Dsp
                 _squelch.PrimeClosed();
             }
 
+            if (options.BlankerThreshold.HasValue)
+            {
+                _blanker = new NoiseBlanker(OutputRate);
+                _blanker.Threshold = options.BlankerThreshold.Value;
+            }
+
             int block = 32768;
             _i = new float[block];
             _q = new float[block];
@@ -222,7 +237,29 @@ namespace Radiocity.Dsp
             }
 
             _nco.MixReal(input, _i, _q, n);
-            int m = _chain.Process(_i, _q, n, _bi, _bq);
+            return Demodulate(_i, _q, n, output);
+        }
+
+        /// <summary>
+        /// Demodulates an already-mixed complex baseband, skipping the NCO.
+        /// This is what makes recorded I/Q replayable: the recording is the
+        /// output of the mixer, so every demodulator can be tried against the
+        /// same capture without going back to the air.
+        /// </summary>
+        public int ProcessBaseband(float[] i, float[] q, int n, float[] output)
+        {
+            if (n > _bi.Length) throw new ArgumentOutOfRangeException("n");
+            return Demodulate(i, q, n, output);
+        }
+
+        private int Demodulate(float[] srcI, float[] srcQ, int n, float[] output)
+        {
+            // The blanker runs first: an impulse that reaches the channel filter
+            // has already been smeared across its whole impulse response, and by
+            // then it cannot be removed without removing the signal too.
+            if (_blanker != null) _blanker.Process(srcI, srcQ, n);
+
+            int m = _chain.Process(srcI, srcQ, n, _bi, _bq);
 
             // Channel power is measured here, where it still means "is there a
             // signal", and the squelch gates the audio after the AGC, where it

@@ -1,5 +1,6 @@
 using System;
 using System.Globalization;
+using System.IO;
 using System.Threading;
 using Radiocity.Audio;
 using Radiocity.Dsp;
@@ -45,6 +46,7 @@ namespace Radiocity.App
                     case "calib": return Calibrate(args);
                     case "dcf77": return Dcf77Live(args);
                     case "web": return WebServe(args);
+                    case "iq": return IqCommand(args);
                     case "help":
                     case "-h":
                     case "--help": return Help();
@@ -102,6 +104,11 @@ namespace Radiocity.App
             Console.WriteLine("  radiocity dcf77 [seconds] [rate]        decode the 77.5 kHz time signal");
             Console.WriteLine("  radiocity web [--sim] [--port N] [--rate N] [--freq N] [--mode M]");
             Console.WriteLine("                                          serve a WebSDR UI on http://localhost:8080");
+            Console.WriteLine("  radiocity iq record <file> <freqHz> [sec] [rate] [decim]");
+            Console.WriteLine("                                          record baseband I/Q for offline analysis");
+            Console.WriteLine("  radiocity iq demod <file> <out.wav> [mode]");
+            Console.WriteLine("                                          demodulate a recording, try any mode");
+            Console.WriteLine("  radiocity iq info <file>                show what a recording contains");
             Console.WriteLine();
             Console.WriteLine("  rate defaults to 48000; 192000 reaches to 96 kHz and is required for DCF77.");
             Console.WriteLine("  add -b24 (or -b8/-b16/-b32) to any command to pick the capture depth.");
@@ -133,6 +140,10 @@ namespace Radiocity.App
             ok &= RunDecimationTest();
             Console.WriteLine();
             ok &= RunSquelchTest();
+            Console.WriteLine();
+            ok &= RunBlankerTest();
+            Console.WriteLine();
+            ok &= RunIqTest();
             Console.WriteLine();
             ok &= RunResamplerTest();
             Console.WriteLine();
@@ -461,6 +472,161 @@ namespace Radiocity.App
             bool ok = !at05 && at15 && !at25;
             Console.WriteLine(ok ? "  PASS" : "  FAIL: gate did not follow the signal");
             return ok;
+        }
+
+        private static bool RunBlankerTest()
+        {
+            // Impulse noise is easy to test honestly because the clean signal is
+            // known exactly: whatever differs from it is the error, and the only
+            // question is whether blanking makes that error smaller.
+            const double rate = 12000.0;
+            const double tone = 800.0;
+            const double amplitude = 0.5;
+            const int n = (int)(rate * 4.0);
+            const int impulsePeriod = 600;      // 20 impulses per second
+            const float impulseLevel = 20.0f;
+
+            float[] cleanI = new float[n];
+            float[] cleanQ = new float[n];
+            for (int k = 0; k < n; k++)
+            {
+                double phase = 2.0 * Math.PI * tone * k / rate;
+                cleanI[k] = (float)(amplitude * Math.Cos(phase));
+                cleanQ[k] = (float)(amplitude * Math.Sin(phase));
+            }
+
+            float[] noisyI = (float[])cleanI.Clone();
+            float[] noisyQ = (float[])cleanQ.Clone();
+            int impulses = 0;
+            for (int k = 100; k < n; k += impulsePeriod)
+            {
+                noisyI[k] += impulseLevel;
+                impulses++;
+            }
+
+            float[] rawI = (float[])noisyI.Clone();
+            float[] rawQ = (float[])noisyQ.Clone();
+
+            NoiseBlanker blanker = new NoiseBlanker(rate);
+            float[] blkI = (float[])noisyI.Clone();
+            float[] blkQ = (float[])noisyQ.Clone();
+            blanker.Process(blkI, blkQ, n);
+
+            double rawError = ComplexError(rawI, rawQ, cleanI, cleanQ, n);
+            double blkError = ComplexError(blkI, blkQ, cleanI, cleanQ, n);
+
+            // The tone must still be there afterwards, or "less error" just means
+            // "less signal".
+            double toneBefore = ComplexTone(cleanI, cleanQ, n, rate, tone);
+            double toneAfter = ComplexTone(blkI, blkQ, n, rate, tone);
+
+            Console.WriteLine("noise blanker self-test");
+            Console.WriteLine("  800 Hz baseband tone, " + impulses + " impulses at " + impulseLevel.ToString("F0", Inv) +
+                              "x amplitude in " + (n / rate).ToString("F0", Inv) + " s");
+            Console.WriteLine("  error without blanker : " + rawError.ToString("F3", Inv));
+            Console.WriteLine("  error with blanker    : " + blkError.ToString("F3", Inv) +
+                              "  (" + (rawError / Math.Max(blkError, 1e-9)).ToString("F1", Inv) + "x less)");
+            Console.WriteLine("  blanked " + blanker.Blanked + " impulses, " + blanker.BlankedSamples +
+                              " samples (" + (100.0 * blanker.BlankedSamples / n).ToString("F2", Inv) + "%)");
+            Console.WriteLine("  tone level " + toneBefore.ToString("F3", Inv) + " -> " + toneAfter.ToString("F3", Inv));
+
+            bool ok = blkError < rawError / 3.0 && toneAfter > toneBefore * 0.98;
+            Console.WriteLine(ok ? "  PASS" : "  FAIL: blanker did not remove the impulses cleanly");
+            return ok;
+        }
+
+        private static double ComplexError(float[] i, float[] q, float[] refI, float[] refQ, int n)
+        {
+            double sum = 0.0;
+            for (int k = 0; k < n; k++)
+            {
+                double di = i[k] - refI[k];
+                double dq = q[k] - refQ[k];
+                sum += di * di + dq * dq;
+            }
+            return Math.Sqrt(sum / n);
+        }
+
+        /// <summary>Magnitude of one complex frequency bin, via a quadrature Goertzel.</summary>
+        private static double ComplexTone(float[] i, float[] q, int n, double rate, double hz)
+        {
+            double re = 0.0, im = 0.0;
+            for (int k = 0; k < n; k++)
+            {
+                double phase = -2.0 * Math.PI * hz * k / rate;
+                double c = Math.Cos(phase);
+                double s = Math.Sin(phase);
+                re += i[k] * c - q[k] * s;
+                im += i[k] * s + q[k] * c;
+            }
+            return 2.0 * Math.Sqrt(re * re + im * im) / n;
+        }
+
+        private static bool RunIqTest()
+        {
+            const int frames = 4096;
+            const int rate = 12000;
+            const double center = 77500.0;
+
+            float[] i = new float[frames];
+            float[] q = new float[frames];
+            Random rnd = new Random(99);
+            for (int k = 0; k < frames; k++)
+            {
+                i[k] = (float)(rnd.NextDouble() * 2.0 - 1.0);
+                q[k] = (float)(rnd.NextDouble() * 2.0 - 1.0);
+            }
+
+            string path = Path.Combine(Path.GetTempPath(), "radiocity_iq_test.wav");
+            float[] backI, backQ;
+            IqFile.Info info;
+            double maxErr;
+
+            try
+            {
+                // Float path: must be bit-exact, because there is nothing to lose.
+                IqFile.Write(path, i, q, frames, rate, center, true);
+                IqFile.Read(path, out backI, out backQ, out info);
+
+                maxErr = 0.0;
+                for (int k = 0; k < frames; k++)
+                {
+                    maxErr = Math.Max(maxErr, Math.Abs(backI[k] - i[k]));
+                    maxErr = Math.Max(maxErr, Math.Abs(backQ[k] - q[k]));
+                }
+
+                bool floatOk = info.Frames == frames && info.SampleRate == rate &&
+                               Math.Abs(info.CenterHz - center) < 0.5 && maxErr < 1e-6;
+
+                // Int16 path: quantisation is allowed, losing the header is not.
+                IqFile.Write(path, i, q, frames, rate, center, false);
+                IqFile.Read(path, out backI, out backQ, out info);
+
+                double int16Err = 0.0;
+                for (int k = 0; k < frames; k++)
+                {
+                    int16Err = Math.Max(int16Err, Math.Abs(backI[k] - i[k]));
+                    int16Err = Math.Max(int16Err, Math.Abs(backQ[k] - q[k]));
+                }
+
+                bool int16Ok = info.Frames == frames && info.Bits == 16 &&
+                               Math.Abs(info.CenterHz - center) < 0.5 && int16Err < 1.0 / 32000.0;
+
+                Console.WriteLine("I/Q file self-test");
+                Console.WriteLine("  float32 round-trip: " + frames + " frames, max error " + maxErr.ToString("E1", Inv) +
+                                  ", centre " + info.CenterHz.ToString("F1", Inv) + " Hz");
+                Console.WriteLine("  int16   round-trip: max error " + int16Err.ToString("E1", Inv) +
+                                  " (quantisation is " + (1.0 / 32768.0).ToString("E1", Inv) + ")");
+
+                bool ok = floatOk && int16Ok;
+                Console.WriteLine(ok ? "  PASS" : "  FAIL: I/Q file lost data or metadata");
+                return ok;
+            }
+            finally
+            {
+                try { File.Delete(path); }
+                catch (IOException) { }
+            }
         }
 
         private static bool RunResamplerTest()
@@ -1029,6 +1195,161 @@ namespace Radiocity.App
                 source.Stop();
             }
 
+            return 0;
+        }
+
+        // ================================================================ iq
+
+        private static int IqCommand(string[] args)
+        {
+            if (args.Length < 2) return Help();
+
+            switch (args[1].ToLowerInvariant())
+            {
+                case "record": return IqRecord(args);
+                case "demod": return IqDemod(args);
+                case "info": return IqInfo(args);
+                default:
+                    Console.Error.WriteLine("unknown iq command: " + args[1]);
+                    return Help();
+            }
+        }
+
+        /// <summary>
+        /// Captures from the sound card, mixes down and decimates, and stores the
+        /// result as I/Q. What gets recorded is exactly what the demodulators
+        /// see, so a recording can be replayed through AM, then FM, then SSB,
+        /// without going back to the air.
+        /// </summary>
+        private static int IqRecord(string[] args)
+        {
+            if (args.Length < 4) return Help();
+
+            string path = args[2];
+            double freq = double.Parse(args[3], Inv);
+            double seconds = args.Length > 4 ? double.Parse(args[4], Inv) : 10.0;
+            int rate = args.Length > 5 ? int.Parse(args[5], Inv) : 48000;
+            int decim = args.Length > 6 ? int.Parse(args[6], Inv) : 4;
+
+            int baseband = Math.Max(1, rate / decim);
+            Nco nco = new Nco();
+            nco.SetFrequency(freq, rate);
+
+            DecimationChain chain = new DecimationChain(rate, baseband, 12000.0, 32768);
+
+            RingBuffer ring = new RingBuffer(1 << 18);
+            float[] block = new float[32768];
+            float[] mi = new float[32768];
+            float[] mq = new float[32768];
+            float[] bi = new float[32768];
+            float[] bq = new float[32768];
+
+            // Growable rather than a fixed size: the capture length is a request,
+            // not a promise, and the driver decides how much actually arrives.
+            float[] outI = new float[baseband * 4];
+            float[] outQ = new float[baseband * 4];
+            int produced = 0;
+
+            using (WaveIn capture = new WaveIn(rate, 1, CaptureBits))
+            {
+                capture.DataAvailable += delegate(float[] buf, int frames) { ring.Write(buf, 0, frames); };
+                capture.Start();
+
+                Console.WriteLine("recording " + seconds.ToString("F0", Inv) + " s at " + freq.ToString("F0", Inv) +
+                                  " Hz, capture " + rate + " Hz " + CaptureBits + " bit, baseband " + baseband + " Hz");
+
+                DateTime deadline = DateTime.UtcNow.AddSeconds(seconds);
+                while (DateTime.UtcNow < deadline)
+                {
+                    if (ring.Count < 4096) { Thread.Sleep(2); continue; }
+
+                    int n = ring.Read(block, 0, block.Length);
+                    nco.MixReal(block, mi, mq, n);
+                    int m = chain.Process(mi, mq, n, bi, bq);
+
+                    if (produced + m > outI.Length)
+                    {
+                        Array.Resize(ref outI, (produced + m) * 2);
+                        Array.Resize(ref outQ, (produced + m) * 2);
+                    }
+
+                    Array.Copy(bi, 0, outI, produced, m);
+                    Array.Copy(bq, 0, outQ, produced, m);
+                    produced += m;
+                }
+
+                capture.Stop();
+            }
+
+            IqFile.Write(path, outI, outQ, produced, baseband, freq, true);
+
+            Console.WriteLine("wrote " + path + ": " + produced + " I/Q frames (" +
+                              (produced / (double)baseband).ToString("F1", Inv) + " s), float32 stereo");
+            return produced > 0 ? 0 : 1;
+        }
+
+        private static int IqDemod(string[] args)
+        {
+            if (args.Length < 4) return Help();
+
+            float[] i, q;
+            IqFile.Info info;
+            IqFile.Read(args[2], out i, out q, out info);
+
+            string mode = args.Length > 4 ? args[4] : "am";
+
+            // Decimation 1: the recording is already baseband at its own rate, so
+            // there is nothing to divide down. The channel filter still runs, at
+            // that rate, and is what sets the bandwidth.
+            ReceiverOptions o = ParseOptions(mode, 0.0, 1);
+            o.Decimation = 1;
+
+            Receiver rx = new Receiver(info.SampleRate, 0.0, o);
+
+            float[] audio = new float[rx.MaxBlock];
+            float[] result = new float[info.Frames + rx.MaxBlock];
+            float[] ci = new float[rx.MaxBlock];
+            float[] cq = new float[rx.MaxBlock];
+            int pos = 0, outPos = 0;
+
+            while (pos < info.Frames)
+            {
+                int n = Math.Min(rx.MaxBlock, info.Frames - pos);
+                Array.Copy(i, pos, ci, 0, n);
+                Array.Copy(q, pos, cq, 0, n);
+
+                int m = rx.ProcessBaseband(ci, cq, n, audio);
+                Array.Copy(audio, 0, result, outPos, m);
+                outPos += m;
+                pos += n;
+            }
+
+            WavFile.Write(args[3], result, outPos, rx.OutputRate);
+
+            Console.WriteLine("recorded at " + info.CenterHz.ToString("F0", Inv) + " Hz, " +
+                              info.SampleRate + " Hz baseband, " + info.Frames + " frames");
+            Console.WriteLine("demodulated as " + rx.Mode + ", wrote " + args[3] + " at " + rx.OutputRate + " Hz");
+            return 0;
+        }
+
+        private static int IqInfo(string[] args)
+        {
+            if (args.Length < 3) return Help();
+
+            // Reads the samples too, not just the header: it is one code path
+            // instead of two, and an I/Q capture is not a 4 GB file.
+            float[] i, q;
+            IqFile.Info info;
+            IqFile.Read(args[2], out i, out q, out info);
+
+            double seconds = info.SampleRate > 0 ? (double)info.Frames / info.SampleRate : 0.0;
+
+            Console.WriteLine("file      : " + args[2]);
+            Console.WriteLine("centre    : " + info.CenterHz.ToString("F0", Inv) + " Hz");
+            Console.WriteLine("baseband  : " + info.SampleRate + " Hz, " + info.Bits + " bit, stereo (I/Q)");
+            Console.WriteLine("frames    : " + info.Frames + " (" + seconds.ToString("F2", Inv) + " s)");
+            Console.WriteLine("band      : " + (info.CenterHz - info.SampleRate / 2.0).ToString("F0", Inv) +
+                              " .. " + (info.CenterHz + info.SampleRate / 2.0).ToString("F0", Inv) + " Hz");
             return 0;
         }
 
