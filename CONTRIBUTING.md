@@ -57,6 +57,25 @@ there is now a round-trip test for exactly that reason.
 | Resampler | amplitude within 2%, > 30 dB | a bad interpolator is audible as dullness |
 | DCF77 | full frame at -40 and -20 dBFS | the second one is a noisy city, not a lab |
 
+## Threading rules
+
+The web front end has three kinds of thread and the rules between them are not
+optional:
+
+| Thread | Owns | Must never |
+|---|---|---|
+| capture | `ISampleSource`, spectrum | block on a session |
+| one per session | NCO, filters, demod, AGC | block on an HTTP client |
+| HTTP pool | one response | touch DSP state without the session's lock |
+
+`RadioSession.Feed` is called by the capture thread and only writes into a
+lock-free ring; if the ring is full the oldest audio is dropped. That is the
+whole reason one slow browser cannot stall anyone else's receiver.
+
+If you add a stage that allocates, allocate it in a constructor. `Process()`
+runs on a session thread that is trying to keep up with real time, and a GC
+pause there is an audible gap.
+
 ## Style
 
 - C# 4.0, `var` is fine, LINQ is fine (it is .NET 3.5+).
