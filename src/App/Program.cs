@@ -3,6 +3,7 @@ using System.Globalization;
 using System.Threading;
 using Radiocity.Audio;
 using Radiocity.Dsp;
+using Radiocity.Web;
 
 namespace Radiocity.App
 {
@@ -21,6 +22,13 @@ namespace Radiocity.App
 
         private static int Main(string[] args)
         {
+            // A pool thread that throws takes the whole process down. Say why,
+            // instead of vanishing silently with a closed port and no clue.
+            AppDomain.CurrentDomain.UnhandledException += delegate(object sender, UnhandledExceptionEventArgs e)
+            {
+                Console.Error.WriteLine("fatal: " + e.ExceptionObject);
+            };
+
             try
             {
                 args = StripBitDepth(args);
@@ -36,6 +44,7 @@ namespace Radiocity.App
                     case "listen": return Listen(args);
                     case "calib": return Calibrate(args);
                     case "dcf77": return Dcf77Live(args);
+                    case "web": return WebServe(args);
                     case "help":
                     case "-h":
                     case "--help": return Help();
@@ -91,9 +100,12 @@ namespace Radiocity.App
             Console.WriteLine("  radiocity listen <tuneHz> [seconds] [am|fm|usb|lsb|cw] [rate] [channelHz]");
             Console.WriteLine("  radiocity calib <refHz> [seconds] [rate]  measure the card's clock error in ppm");
             Console.WriteLine("  radiocity dcf77 [seconds] [rate]        decode the 77.5 kHz time signal");
+            Console.WriteLine("  radiocity web [--sim] [--port N] [--rate N] [--freq N] [--mode M]");
+            Console.WriteLine("                                          serve a WebSDR UI on http://localhost:8080");
             Console.WriteLine();
             Console.WriteLine("  rate defaults to 48000; 192000 reaches to 96 kHz and is required for DCF77.");
             Console.WriteLine("  add -b24 (or -b8/-b16/-b32) to any command to pick the capture depth.");
+            Console.WriteLine("  add --sim to 'web' to serve a synthetic band, no sound card needed.");
             Console.WriteLine();
             Console.WriteLine("  Reality check: a sound card ADC stops at its own sample rate, so it hears");
             Console.WriteLine("  0..96 kHz at best. Broadcast FM at 87.5 MHz needs a downconverter in front");
@@ -117,6 +129,10 @@ namespace Radiocity.App
             ok &= RunCwTest();
             Console.WriteLine();
             ok &= RunCalibTest();
+            Console.WriteLine();
+            ok &= RunDecimationTest();
+            Console.WriteLine();
+            ok &= RunSquelchTest();
             Console.WriteLine();
             ok &= RunResamplerTest();
             Console.WriteLine();
@@ -322,6 +338,128 @@ namespace Radiocity.App
 
             bool ok = Math.Abs(r.Ppm - truePpm) < 1.5;
             Console.WriteLine(ok ? "  PASS" : "  FAIL: ppm estimate is off");
+            return ok;
+        }
+
+        private static bool RunDecimationTest()
+        {
+            // At 192 kHz, a 9 kHz AM channel needs a transition band of 1.5 kHz.
+            // One filter doing that in a single step is expensive; splitting it
+            // 192k -> 24k -> 12k is roughly four times cheaper for the same
+            // result. This measures both, so the claim is checkable.
+            const double fs = 192000.0;
+            const double carrier = 30000.0;
+            const double tone = 1000.0;
+            const int decim = 16;
+
+            int n = (int)(fs * 2.0);
+            float[] input = new float[n];
+            for (int i = 0; i < n; i++)
+            {
+                double t = i / fs;
+                double m = 1.0 + 0.6 * Math.Cos(2.0 * Math.PI * tone * t);
+                input[i] = (float)(m * Math.Cos(2.0 * Math.PI * carrier * t) / 1.6);
+            }
+
+            ReceiverOptions o = ReceiverOptions.Am(decim);
+            o.ChannelHz = 9000.0;
+
+            Receiver rx = new Receiver(fs, carrier, o);
+            float[] output = Run(rx, input);
+
+            double residual;
+            double level = MeasureTone(output, rx.OutputRate, tone, out residual);
+
+            // Single-stage cost, computed with the same Kaiser formula.
+            double pass = 4500.0 / fs;
+            double stop = 0.5 / decim;
+            int singleTaps = (int)Math.Ceiling(62.0 / (2.285 * 2.0 * Math.PI * (stop - pass)));
+            double singleMacs = singleTaps * fs;
+
+            Console.WriteLine("decimation self-test");
+            Console.WriteLine("  192 kHz -> " + rx.OutputRate + " Hz in " + rx.DecimationStages +
+                              " stage(s), " + rx.Taps + " taps total");
+            Console.WriteLine("  single stage would need " + singleTaps + " taps at " + fs.ToString("F0", Inv) +
+                              " Hz = " + (singleMacs / 1e6).ToString("F0", Inv) + " M multiply-adds/s");
+            Console.WriteLine("  this chain costs " + (rx.FilterCost / 1e6).ToString("F0", Inv) +
+                              " M/s, so " + (singleMacs / Math.Max(1.0, rx.FilterCost)).ToString("F1", Inv) + "x cheaper");
+            Console.WriteLine("  tone " + level.ToString("F3", Inv) + ", distortion " +
+                              Db(level / residual).ToString("F1", Inv) + " dB below");
+
+            bool ok = Math.Abs(level - 0.30) < 0.03 && rx.DecimationStages >= 2;
+
+            // Split factors must multiply back to the requested decimation.
+            int[] parts = DecimationChain.SplitDecimation(decim);
+            int product = 1;
+            for (int i = 0; i < parts.Length; i++)
+            {
+                product *= parts[i];
+                if (parts[i] > 8) ok = false;
+            }
+            if (product != decim) ok = false;
+
+            Console.WriteLine("  split of x" + decim + ": " + string.Join(" x ", IntToStrings(parts)) +
+                              " = " + product);
+            Console.WriteLine(ok ? "  PASS" : "  FAIL: chain output or split is wrong");
+            return ok;
+        }
+
+        private static string[] IntToStrings(int[] values)
+        {
+            string[] s = new string[values.Length];
+            for (int i = 0; i < values.Length; i++) s[i] = values[i].ToString(Inv);
+            return s;
+        }
+
+        private static bool RunSquelchTest()
+        {
+            const double fs = 48000.0;
+            const double carrier = 12000.0;
+            int n = (int)(fs * 3.0);
+
+            // One second of nothing, one second of carrier, one second of nothing.
+            float[] input = new float[n];
+            for (int i = 0; i < n; i++)
+            {
+                double t = i / fs;
+                bool on = t >= 1.0 && t < 2.0;
+                input[i] = on ? (float)Math.Cos(2.0 * Math.PI * carrier * t) : 0.0f;
+            }
+
+            ReceiverOptions o = ReceiverOptions.Am(4);
+            o.SquelchDb = -40.0f;
+
+            Receiver rx = new Receiver(fs, carrier, o);
+
+            float[] block = new float[rx.MaxBlock];
+            float[] audio = new float[rx.MaxBlock];
+            bool at05 = false, at15 = false, at25 = false;
+            bool got05 = false, got15 = false, got25 = false;
+            int pos = 0;
+
+            while (pos < n)
+            {
+                int chunk = Math.Min(rx.MaxBlock, n - pos);
+                Array.Copy(input, pos, block, 0, chunk);
+                rx.Process(block, chunk, audio);
+                pos += chunk;
+
+                // Latch once at each checkpoint. Re-reading every later block
+                // would let the flags follow the signal instead of sampling it.
+                double t = (double)pos / fs;
+                if (!got05 && t >= 0.6) { at05 = rx.Squelch.Open; got05 = true; }
+                if (!got15 && t >= 1.6) { at15 = rx.Squelch.Open; got15 = true; }
+                if (!got25 && t >= 2.6) { at25 = rx.Squelch.Open; got25 = true; }
+            }
+
+            Console.WriteLine("squelch self-test");
+            Console.WriteLine("  1 s silence, 1 s carrier, 1 s silence, threshold -40 dBFS");
+            Console.WriteLine("  gate at 0.6 s: " + (at05 ? "open" : "muted") +
+                              ", at 1.6 s: " + (at15 ? "open" : "muted") +
+                              ", at 2.6 s: " + (at25 ? "open" : "muted"));
+
+            bool ok = !at05 && at15 && !at25;
+            Console.WriteLine(ok ? "  PASS" : "  FAIL: gate did not follow the signal");
             return ok;
         }
 
@@ -816,6 +954,106 @@ namespace Radiocity.App
 
             Console.WriteLine("pulses " + dec.Pulses + ", frames " + dec.ValidFrames + "/" + dec.Frames + " valid");
             return dec.ValidFrames > 0 ? 0 : 1;
+        }
+
+        // ================================================================ web
+
+        private static int WebServe(string[] args)
+        {
+            bool simulated = false;
+            int port = 8080;
+            int rate = 48000;
+            double freq = 12000.0;
+            DemodMode mode = DemodMode.Am;
+            int bits = CaptureBits;
+
+            for (int i = 1; i < args.Length; i++)
+            {
+                string a = args[i].ToLowerInvariant();
+
+                if (a == "--sim") simulated = true;
+                else if (a == "--port" && i + 1 < args.Length) port = int.Parse(args[++i], Inv);
+                else if (a == "--rate" && i + 1 < args.Length) rate = int.Parse(args[++i], Inv);
+                else if (a == "--freq" && i + 1 < args.Length) freq = double.Parse(args[++i], Inv);
+                else if (a == "--bits" && i + 1 < args.Length) bits = int.Parse(args[++i], Inv);
+                else if (a == "--mode" && i + 1 < args.Length) mode = ParseMode(args[++i]);
+            }
+
+            ISampleSource source;
+            if (simulated)
+            {
+                source = new SyntheticSource(rate);
+                Console.WriteLine("source: " + source.Description + " (no sound card needed)");
+            }
+            else
+            {
+                try
+                {
+                    source = new WaveInSource(rate, bits);
+                    Console.WriteLine("source: " + source.Description);
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine("cannot open the sound card: " + ex.Message);
+                    Console.Error.WriteLine("try:  radiocity web --sim     (synthetic band, no hardware)");
+                    return 1;
+                }
+            }
+
+            using (WebRadio radio = new WebRadio(source, freq, mode, DefaultChannel(mode)))
+            using (HttpServer server = new HttpServer(port, radio.Handle))
+            {
+                source.Start();
+                radio.Start();
+                server.Start();
+
+                Console.WriteLine();
+                Console.WriteLine("  Radiocity " + Version + " listening on http://localhost:" + port + "/");
+                Console.WriteLine("  tuned to " + freq.ToString("F0", Inv) + " Hz, " + radio.Mode +
+                                  ", band 0.." + (rate / 2).ToString("F0", Inv) + " Hz");
+                Console.WriteLine("  press Ctrl+C to stop");
+                Console.WriteLine();
+
+                ManualResetEvent stop = new ManualResetEvent(false);
+                Console.CancelKeyPress += delegate(object sender, ConsoleCancelEventArgs e)
+                {
+                    e.Cancel = true;
+                    stop.Set();
+                };
+
+                stop.WaitOne();
+
+                Console.WriteLine("stopping...");
+                server.Stop();
+                radio.Stop();
+                source.Stop();
+            }
+
+            return 0;
+        }
+
+        private static DemodMode ParseMode(string text)
+        {
+            switch (text.ToLowerInvariant())
+            {
+                case "fm": return DemodMode.Fm;
+                case "usb": return DemodMode.Usb;
+                case "lsb": return DemodMode.Lsb;
+                case "cw": return DemodMode.Cw;
+                default: return DemodMode.Am;
+            }
+        }
+
+        private static double DefaultChannel(DemodMode mode)
+        {
+            switch (mode)
+            {
+                case DemodMode.Fm: return 180000.0;
+                case DemodMode.Usb:
+                case DemodMode.Lsb: return 2400.0;
+                case DemodMode.Cw: return 500.0;
+                default: return 9000.0;
+            }
         }
     }
 }

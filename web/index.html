@@ -1,0 +1,568 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Radiocity</title>
+<style>
+  :root {
+    --bg: #0a101a;
+    --panel: #161e2a;
+    --line: #22303f;
+    --cyan: #37d0e8;
+    --cyan-dim: #1e7a96;
+    --amber: #f5a524;
+    --text: #cfdae6;
+    --muted: #6b8095;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 "Segoe UI", system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  header {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 12px 20px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--line);
+  }
+
+  header h1 {
+    margin: 0;
+    font-size: 16px;
+    font-weight: 600;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--cyan);
+  }
+
+  .freq {
+    font: 600 26px/1 "Consolas", "Courier New", monospace;
+    color: var(--cyan);
+    letter-spacing: .04em;
+    min-width: 190px;
+  }
+
+  .freq small { font-size: 13px; color: var(--muted); margin-left: 6px; }
+
+  .modes { display: flex; gap: 4px; }
+
+  button {
+    background: #1d2735;
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 7px 13px;
+    font: inherit;
+    font-size: 13px;
+    cursor: pointer;
+    transition: background .12s, border-color .12s, color .12s;
+  }
+
+  button:hover { background: #26344a; border-color: var(--cyan-dim); }
+  button.active { background: var(--cyan-dim); border-color: var(--cyan); color: #eafcff; }
+  button.primary { background: var(--cyan-dim); border-color: var(--cyan); color: #eafcff; font-weight: 600; }
+  button:disabled { opacity: .45; cursor: default; }
+
+  main { padding: 16px 20px 40px; }
+
+  .scope {
+    position: relative;
+    background: #060a10;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    overflow: hidden;
+  }
+
+  canvas { display: block; width: 100%; height: 300px; cursor: crosshair; }
+
+  .axis {
+    display: flex;
+    justify-content: space-between;
+    padding: 5px 10px 7px;
+    font: 11px/1 "Consolas", monospace;
+    color: var(--muted);
+    background: #0b1219;
+    border-top: 1px solid var(--line);
+  }
+
+  .controls {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+    gap: 14px;
+    margin-top: 16px;
+  }
+
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 13px 15px;
+  }
+
+  .card label {
+    display: flex;
+    justify-content: space-between;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: .09em;
+    color: var(--muted);
+    margin-bottom: 9px;
+  }
+
+  .card label b { color: var(--cyan); font-weight: 600; }
+
+  input[type=range] {
+    width: 100%;
+    accent-color: var(--cyan);
+    background: transparent;
+  }
+
+  .meter {
+    height: 9px;
+    background: #0b1219;
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    overflow: hidden;
+    margin-top: 4px;
+  }
+
+  .meter i {
+    display: block;
+    height: 100%;
+    width: 0;
+    background: linear-gradient(90deg, var(--cyan-dim), var(--cyan) 70%, var(--amber));
+    transition: width .12s linear;
+  }
+
+  .row { display: flex; gap: 8px; align-items: center; }
+
+  .note {
+    margin-top: 18px;
+    font-size: 12px;
+    color: var(--muted);
+    max-width: 78ch;
+  }
+
+  .note code {
+    background: #0b1219;
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 1px 5px;
+    color: var(--cyan);
+  }
+
+  .badge {
+    font: 11px/1 "Consolas", monospace;
+    padding: 3px 7px;
+    border-radius: 4px;
+    border: 1px solid var(--line);
+    color: var(--muted);
+  }
+
+  .badge.on { color: #06202a; background: var(--cyan); border-color: var(--cyan); }
+
+  #err {
+    display: none;
+    margin-top: 12px;
+    padding: 10px 13px;
+    border-radius: 8px;
+    background: #2a1416;
+    border: 1px solid #5a2430;
+    color: #ff9aa8;
+    font-size: 13px;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Radiocity</h1>
+  <div class="freq" id="freq">0 <small>Hz</small></div>
+  <div class="modes" id="modes">
+    <button data-mode="am">AM</button>
+    <button data-mode="fm">FM</button>
+    <button data-mode="usb">USB</button>
+    <button data-mode="lsb">LSB</button>
+    <button data-mode="cw">CW</button>
+  </div>
+  <div class="row" style="margin-left:auto">
+    <span class="badge" id="squelchBadge">squelch</span>
+    <button id="audioBtn" class="primary">▶ Listen</button>
+  </div>
+</header>
+
+<main>
+  <div class="scope">
+    <canvas id="wf" width="900" height="300"></canvas>
+    <div class="axis">
+      <span id="ax0">0</span><span id="ax1"></span><span id="ax2"></span>
+      <span id="ax3"></span><span id="ax4"></span><span id="ax5"></span>
+      <span id="ax6"></span><span id="ax7"></span><span id="ax8"></span>
+    </div>
+  </div>
+
+  <div id="err"></div>
+
+  <div class="controls">
+    <div class="card">
+      <label>Frequency <b><span id="freqOut">0</span> Hz</b></label>
+      <input type="range" id="freqRange" min="0" max="24000" step="10" value="0">
+      <div class="row" style="margin-top:8px">
+        <button id="fineDown">− 100</button>
+        <button id="fineUp">+ 100</button>
+        <button id="fineDown10">− 10</button>
+        <button id="fineUp10">+ 10</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <label>Channel width <b><span id="bwOut">9000</span> Hz</b></label>
+      <input type="range" id="bwRange" min="200" max="24000" step="100" value="9000">
+    </div>
+
+    <div class="card">
+      <label>Squelch <b><span id="sqOut">off</span></b></label>
+      <input type="range" id="sqRange" min="-120" max="-10" step="1" value="-120">
+    </div>
+
+    <div class="card">
+      <label>Level <b><span id="lvlOut">—</span> dBFS</b></label>
+      <div class="meter"><i id="lvlBar"></i></div>
+    </div>
+  </div>
+
+  <p class="note">
+    Click anywhere on the waterfall to tune. The waterfall spans <code>0</code> to
+    <code>rate/2</code>; with a 192 kHz card that is 0–96 kHz, which is where VLF
+    lives. Broadcast FM at 87.5 MHz is <em>not</em> in here and cannot be: it needs
+    a downconverter in front of the sound card.
+  </p>
+</main>
+
+<script>
+(function () {
+  "use strict";
+
+  var BINS = 256;
+  var canvas = document.getElementById("wf");
+  var ctx = canvas.getContext("2d", { alpha: false });
+
+  var nextFrom = 0;
+  var rate = 24000;
+  var state = { freq: 0, mode: "AM", channel: 9000 };
+  var polling = true;
+
+  // ---------------------------------------------------------------- palette
+
+  var palette = new Array(256);
+  for (var i = 0; i < 256; i++) {
+    var t = i / 255, r, g, b;
+    if (t < 0.25)      { var u = t / 0.25;              r = 0;                      g = 0;                        b = 40 + u * 170; }
+    else if (t < 0.5)  { var u2 = (t - 0.25) / 0.25;    r = 0;                      g = u2 * 200;                 b = 210 + u2 * 45; }
+    else if (t < 0.75) { var u3 = (t - 0.5) / 0.25;     r = u3 * 255;               g = 200 + u3 * 55;            b = 255 - u3 * 200; }
+    else               { var u4 = (t - 0.75) / 0.25;    r = 255;                    g = 255 - u4 * 85;            b = 55 + u4 * 200; }
+    palette[i] = "rgb(" + (r | 0) + "," + (g | 0) + "," + (b | 0) + ")";
+  }
+
+  // ---------------------------------------------------------------- waterfall
+
+  function drawColumn(col) {
+    ctx.drawImage(canvas, -1, 0);
+
+    var h = canvas.height;
+    var x = canvas.width - 1;
+    for (var y = 0; y < BINS; y++) {
+      ctx.fillStyle = palette[col[y]];
+      // Bin 0 is DC and belongs at the bottom, the way a spectrum analyser reads.
+      ctx.fillRect(x, h - 1 - Math.round(y * (h - 1) / (BINS - 1)), 1, 2);
+    }
+  }
+
+  function poll() {
+    if (!polling) return;
+
+    fetch("/waterfall?from=" + nextFrom, { cache: "no-store" })
+      .then(function (res) {
+        var next = res.headers.get("X-Next-From");
+        var bins = parseInt(res.headers.get("X-Bins") || "256", 10);
+        var r = parseInt(res.headers.get("X-Rate") || "24000", 10);
+        if (r && r !== rate) { rate = r; updateAxis(); }
+        if (bins !== BINS) BINS = bins;
+        return res.arrayBuffer().then(function (buf) {
+          var bytes = new Uint8Array(buf);
+          var cols = Math.floor(bytes.length / BINS);
+          // A long absence produces a burst; show the most recent screenful only.
+          var start = Math.max(0, cols - canvas.width);
+          for (var c = start; c < cols; c++) {
+            drawColumn(bytes.subarray(c * BINS, (c + 1) * BINS));
+          }
+          if (next) nextFrom = parseInt(next, 10);
+        });
+      })
+      .catch(function () { /* server restarting; try again */ })
+      .then(function () { setTimeout(poll, 50); });
+  }
+
+  function updateAxis() {
+    var half = rate / 2;
+    for (var i = 0; i <= 8; i++) {
+      var el = document.getElementById("ax" + i);
+      if (el) el.textContent = Math.round(half * i / 8).toLocaleString();
+    }
+    var range = document.getElementById("freqRange");
+    range.max = half;
+  }
+
+  // ---------------------------------------------------------------- tuning
+
+  var tuneTimer = null;
+  var pendingFreq = null;
+
+  function tuneTo(hz, immediate) {
+    hz = Math.max(0, Math.min(rate / 2 - 500, Math.round(hz)));
+    state.freq = hz;
+    document.getElementById("freq").innerHTML = hz.toLocaleString() + " <small>Hz</small>";
+    document.getElementById("freqOut").textContent = hz.toLocaleString();
+    document.getElementById("freqRange").value = hz;
+
+    pendingFreq = hz;
+    if (immediate) { sendTune(); return; }
+
+    // Sliding a slider should not flood the server: coalesce to 10 per second.
+    if (tuneTimer) return;
+    tuneTimer = setTimeout(function () { tuneTimer = null; sendTune(); }, 100);
+  }
+
+  function sendTune() {
+    if (pendingFreq === null) return;
+    var f = pendingFreq;
+    pendingFreq = null;
+
+    var bw = document.getElementById("bwRange").value;
+    var sq = document.getElementById("sqRange").value;
+    var body = "f=" + f + "&mode=" + state.mode.toLowerCase() + "&bw=" + bw;
+    if (sq > -120) body += "&squelch=" + sq;
+
+    fetch("/tune", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: body
+    })
+      .then(function (r) { return r.json(); })
+      .then(applyState)
+      .catch(function (e) { showError("tune failed: " + e.message); });
+  }
+
+  function applyState(s) {
+    if (!s) return;
+    if (s.rate) { rate = s.rate; updateAxis(); }
+    if (typeof s.level === "number") updateLevel(s.level);
+    var badge = document.getElementById("squelchBadge");
+    if (s.open === false) { badge.className = "badge"; badge.textContent = "muted"; }
+    else { badge.className = "badge on"; badge.textContent = "squelch"; }
+  }
+
+  function updateLevel(db) {
+    document.getElementById("lvlOut").textContent = db.toFixed(1);
+    var pct = Math.max(0, Math.min(100, (db + 110) / 90 * 100));
+    document.getElementById("lvlBar").style.width = pct + "%";
+  }
+
+  canvas.addEventListener("click", function (e) {
+    var rect = canvas.getBoundingClientRect();
+    var frac = (e.clientX - rect.left) / rect.width;
+    tuneTo(frac * (rate / 2), true);
+  });
+
+  document.getElementById("freqRange").addEventListener("input", function () {
+    tuneTo(parseInt(this.value, 10), false);
+  });
+
+  function nudge(delta) {
+    tuneTo(state.freq + delta, true);
+  }
+  document.getElementById("fineDown").onclick = function () { nudge(-100); };
+  document.getElementById("fineUp").onclick = function () { nudge(100); };
+  document.getElementById("fineDown10").onclick = function () { nudge(-10); };
+  document.getElementById("fineUp10").onclick = function () { nudge(10); };
+
+  document.getElementById("bwRange").addEventListener("input", function () {
+    document.getElementById("bwOut").textContent = this.value;
+  });
+  document.getElementById("bwRange").addEventListener("change", function () {
+    state.channel = parseInt(this.value, 10);
+    pendingFreq = state.freq;
+    sendTune();
+  });
+
+  document.getElementById("sqRange").addEventListener("input", function () {
+    var v = parseInt(this.value, 10);
+    document.getElementById("sqOut").textContent = v <= -120 ? "off" : v + " dB";
+  });
+  document.getElementById("sqRange").addEventListener("change", function () {
+    pendingFreq = state.freq;
+    sendTune();
+  });
+
+  var modeButtons = document.querySelectorAll("#modes button");
+  Array.prototype.forEach.call(modeButtons, function (btn) {
+    btn.onclick = function () {
+      Array.prototype.forEach.call(modeButtons, function (b) { b.className = ""; });
+      btn.className = "active";
+      state.mode = btn.getAttribute("data-mode").toUpperCase();
+
+      // Sensible default width per mode, so switching to CW actually narrows.
+      var bw = { AM: 9000, FM: 180000, USB: 2400, LSB: 2400, CW: 500 }[state.mode] || 9000;
+      if (bw > rate / 2) bw = Math.round(rate / 2 * 0.8);
+      document.getElementById("bwRange").value = bw;
+      document.getElementById("bwOut").textContent = bw;
+      state.channel = bw;
+
+      pendingFreq = state.freq;
+      sendTune();
+    };
+  });
+
+  function showError(msg) {
+    var el = document.getElementById("err");
+    el.textContent = msg;
+    el.style.display = "block";
+  }
+
+  // ---------------------------------------------------------------- audio
+
+  var audioCtx = null;
+  var node = null;
+  var ring = new Float32Array(1 << 15);
+  var ringRead = 0;
+  var ringWrite = 0;
+  var reader = null;
+  var pumping = false;
+
+  function startAudio() {
+    if (audioCtx) return;
+
+    var Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) { showError("This browser has no Web Audio support."); return; }
+
+    audioCtx = new Ctx();
+    if (audioCtx.resume) audioCtx.resume();
+
+    // ScriptProcessorNode is deprecated but works everywhere, including
+    // browsers that would refuse an AudioWorklet loaded from a blob URL.
+    node = audioCtx.createScriptProcessor(2048, 0, 1);
+    node.onaudioprocess = function (e) {
+      var out = e.outputBuffer.getChannelData(0);
+      var mask = ring.length - 1;
+      for (var i = 0; i < out.length; i++) {
+        if (ringRead === ringWrite) { out[i] = 0; continue; }
+        out[i] = ring[ringRead & mask];
+        ringRead++;
+      }
+      // Resynchronise if the producer lapped us.
+      if (ringWrite - ringRead > ring.length) ringRead = ringWrite - ring.length;
+    };
+    node.connect(audioCtx.destination);
+
+    pumping = true;
+    pump();
+  }
+
+  function stopAudio() {
+    pumping = false;
+    if (reader) { try { reader.cancel(); } catch (e) { } reader = null; }
+    if (node) { try { node.disconnect(); } catch (e) { } node = null; }
+    if (audioCtx) { try { audioCtx.close(); } catch (e) { } audioCtx = null; }
+    ringRead = ringWrite = 0;
+  }
+
+  function pump() {
+    if (!pumping) return;
+
+    fetch("/audio", { cache: "no-store" })
+      .then(function (res) {
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        if (!res.body || !res.body.getReader) {
+          throw new Error("streaming fetch is not supported by this browser");
+        }
+        reader = res.body.getReader();
+        return readLoop();
+      })
+      .catch(function (e) {
+        showError("audio: " + e.message);
+        stopAudio();
+        document.getElementById("audioBtn").textContent = "▶ Listen";
+        document.getElementById("audioBtn").className = "primary";
+      });
+  }
+
+  var carry = null;
+
+  function readLoop() {
+    return reader.read().then(function (r) {
+      if (r.done || !pumping) return;
+
+      var bytes = r.value;
+      if (carry) {
+        var merged = new Uint8Array(carry.length + bytes.length);
+        merged.set(carry); merged.set(bytes, carry.length);
+        bytes = merged;
+        carry = null;
+      }
+
+      var even = bytes.length & ~1;
+      if (even < bytes.length) carry = bytes.slice(even);
+
+      var view = new DataView(bytes.buffer, bytes.byteOffset, even);
+      var mask = ring.length - 1;
+
+      for (var i = 0; i < even; i += 2) {
+        var s = view.getInt16(i, true) / 32768;
+        if (ringWrite - ringRead < ring.length - 1) {
+          ring[ringWrite & mask] = s;
+          ringWrite++;
+        }
+      }
+
+      return readLoop();
+    });
+  }
+
+  document.getElementById("audioBtn").onclick = function () {
+    if (audioCtx) {
+      stopAudio();
+      this.textContent = "▶ Listen";
+      this.className = "primary";
+    } else {
+      startAudio();
+      this.textContent = "■ Stop";
+      this.className = "";
+    }
+  };
+
+  // ---------------------------------------------------------------- boot
+
+  updateAxis();
+  document.querySelector('#modes button[data-mode="am"]').className = "active";
+  poll();
+
+  // Keep the meter and squelch badge alive even while idle.
+  setInterval(function () {
+    fetch("/state", { cache: "no-store" })
+      .then(function (r) { return r.json(); })
+      .then(applyState)
+      .catch(function () { });
+  }, 700);
+})();
+</script>
+</body>
+</html>

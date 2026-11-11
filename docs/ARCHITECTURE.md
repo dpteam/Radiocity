@@ -132,7 +132,6 @@ interpolation on the log magnitudes, then a fine Goertzel sweep. FFT alone gives
 ±4 ppm; the refinement gets under 1 ppm.
 
 ## DCF77 — `src/Dsp/Dcf77.cs`
-
 An entirely different kind of receiver, which is why it lives on its own: one
 bit per second, so the "demodulator" is an envelope detector and a threshold.
 
@@ -154,6 +153,37 @@ Three things that break naive decoders:
 
 Frame sync comes from the missing pulse at second 59: the gap across a minute
 boundary is ~2 s instead of ~1 s.
+
+## The web layer — `src/Web/`
+
+One receiver, many listeners. The DSP runs whether anyone is connected or not;
+audio clients attach and detach, and the waterfall keeps rolling.
+
+```
+ISampleSource ──► WebRadio (DSP thread) ──┬──► per-client RingBuffer ──► /audio
+   waveIn or synthetic                    └──► spectrum columns ──────► /waterfall
+```
+
+**Why not `HttpListener`:** it is a wrapper over `http.sys`, and registering a
+URL prefix requires administrator rights on Windows XP. Since XP is an explicit
+target, the server is a plain `TcpListener` with hand-written HTTP/1.1. It
+implements keep-alive, query strings, form bodies, `Content-Length` responses
+and chunked streaming — the minimum a WebSDR needs.
+
+**Why polling and not WebSockets:** .NET 4.0 has no `System.Net.WebSockets`
+(that arrived in 4.5). Audio is a chunked HTTP response consumed with
+`fetch` + `ReadableStream`; the waterfall is a poll for the columns produced
+since a watermark. A slow client gets the columns it missed in one response
+instead of silently dropping them.
+
+**Blocking writes are the clock.** The DSP thread calls `Broadcast`, which never
+blocks; a client that falls behind has its oldest audio dropped so latency stays
+bounded. The HTTP thread blocks in `Drain` waiting for samples, which paces it to
+real time without a timer.
+
+**FFT length is chosen from the sample rate** (`PickFftSize`) so the waterfall
+runs at about 25 columns per second at 48 kHz and at 192 kHz alike. A fixed
+2048-point FFT would scroll four times too fast at 192 kHz.
 
 ## Performance notes
 

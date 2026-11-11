@@ -1,4 +1,5 @@
 using System;
+using System.Threading;
 
 namespace Radiocity.Dsp
 {
@@ -37,6 +38,9 @@ namespace Radiocity.Dsp
         /// </summary>
         public bool AgcEnabled;
 
+        /// <summary>Squelch threshold in dBFS of channel power; null disables it.</summary>
+        public float? SquelchDb;
+
         public ReceiverOptions()
         {
             Mode = DemodMode.Am;
@@ -47,6 +51,7 @@ namespace Radiocity.Dsp
             BfoHz = 0.0;
             SsbTaps = 127;
             AgcEnabled = true;
+            SquelchDb = null;
         }
 
         public static ReceiverOptions Am(int decimation)
@@ -74,7 +79,7 @@ namespace Radiocity.Dsp
             ReceiverOptions o = new ReceiverOptions();
             o.Mode = upperSideband ? DemodMode.Usb : DemodMode.Lsb;
             o.Decimation = decimation;
-            o.ChannelHz = 3000.0;
+            o.ChannelHz = 2400.0;
             return o;
         }
 
@@ -83,7 +88,11 @@ namespace Radiocity.Dsp
             ReceiverOptions o = new ReceiverOptions();
             o.Mode = DemodMode.Cw;
             o.Decimation = decimation;
-            o.ChannelHz = 1200.0;
+
+            // 500 Hz channel: 250 Hz either side of the carrier. Wide enough that
+            // a little drift does not lose the signal, narrow enough that the
+            // noise floor drops by about 13 dB against a 2.4 kHz SSB filter.
+            o.ChannelHz = 500.0;
             o.BfoHz = pitchHz;
             return o;
         }
@@ -91,17 +100,19 @@ namespace Radiocity.Dsp
 
     /// <summary>
     /// The whole receive chain in one place: tune, mix, channel-filter, decimate,
-    /// demodulate, AGC. Everything is preallocated; Process() performs zero heap
-    /// allocations so it can run on the audio callback thread without waking the GC.
+    /// demodulate, AGC, squelch. Everything is preallocated; Process() performs
+    /// zero heap allocations so it can run on the audio callback thread without
+    /// waking the GC.
     /// </summary>
     public sealed class Receiver
     {
         private readonly Nco _nco;
-        private readonly ComplexDecimator _decim;
+        private readonly DecimationChain _chain;
         private readonly AmDemod _am;
         private readonly FmDemod _fm;
         private readonly SsbDemod _ssb;
         private readonly Agc _agc;
+        private readonly Squelch _squelch;
         private readonly DemodMode _mode;
         private readonly bool _agcEnabled;
 
@@ -110,6 +121,15 @@ namespace Radiocity.Dsp
         private readonly float[] _bi;
         private readonly float[] _bq;
         private readonly float[] _audio;
+
+        /// <summary>
+        /// Pending tune in whole Hz, 0 meaning none. An int so the write is atomic
+        /// on every CPU this runs on: the DSP thread reads it at the start of a
+        /// block and never sees a half-updated double.
+        /// </summary>
+        private volatile int _pendingTuneHz;
+
+        private float _levelDb = -120.0f;
 
         public Receiver(double sampleRate, double tuneHz, ReceiverOptions options)
         {
@@ -122,9 +142,8 @@ namespace Radiocity.Dsp
             _nco = new Nco();
             _nco.SetFrequency(tuneHz, sampleRate);
 
-            _decim = new ComplexDecimator(
-                DesignChannelFilter(sampleRate, OutputRate, options.ChannelHz, options.Decimation),
-                options.Decimation);
+            _chain = new DecimationChain(sampleRate, OutputRate, options.ChannelHz, 32768);
+            OutputRate = _chain.OutputRate;
 
             switch (_mode)
             {
@@ -151,6 +170,17 @@ namespace Radiocity.Dsp
             _agc = voice ? new Agc(OutputRate, 40.0, 600.0, 0.30) : new Agc(OutputRate, 25.0, 400.0, 0.30);
             _agcEnabled = options.AgcEnabled;
 
+            _squelch = new Squelch(OutputRate);
+            if (options.SquelchDb.HasValue)
+            {
+                _squelch.Enabled = true;
+                _squelch.ThresholdDb = options.SquelchDb.Value;
+
+                // Start muted: opening on the first block of noise would defeat
+                // the point of having a squelch at all.
+                _squelch.PrimeClosed();
+            }
+
             int block = 32768;
             _i = new float[block];
             _q = new float[block];
@@ -162,12 +192,21 @@ namespace Radiocity.Dsp
         public double SampleRate { get; private set; }
         public int OutputRate { get; private set; }
         public int MaxBlock { get { return _i.Length; } }
-        public int Taps { get { return _decim.Taps; } }
-        public DemodMode Mode { get { return _mode; } }
+        public int Taps { get { return _chain.TotalTaps; } }
+        public int DecimationStages { get { return _chain.Stages; } }
 
+        /// <summary>Filter multiply-adds per second; the real cost figure.</summary>
+        public double FilterCost { get { return _chain.CostPerSecond; } }
+        public DemodMode Mode { get { return _mode; } }
+        public Squelch Squelch { get { return _squelch; } }
+
+        /// <summary>Channel power in dBFS, for meters and the web UI.</summary>
+        public float LevelDb { get { return _levelDb; } }
+
+        /// <summary>Safe to call from any thread; takes effect at the next block.</summary>
         public void SetTune(double hz)
         {
-            _nco.SetFrequency(hz, SampleRate);
+            _pendingTuneHz = (int)Math.Round(hz);
         }
 
         /// <summary>Returns the number of audio samples written to output.</summary>
@@ -175,8 +214,27 @@ namespace Radiocity.Dsp
         {
             if (n > _i.Length) throw new ArgumentOutOfRangeException("n");
 
+            int tune = _pendingTuneHz;
+            if (tune != 0)
+            {
+                _nco.SetFrequency(tune, SampleRate);
+                _pendingTuneHz = 0;
+            }
+
             _nco.MixReal(input, _i, _q, n);
-            int m = _decim.Process(_i, _q, n, _bi, _bq);
+            int m = _chain.Process(_i, _q, n, _bi, _bq);
+
+            // Channel power is measured here, where it still means "is there a
+            // signal", and the squelch gates the audio after the AGC, where it
+            // does not. The meter reads the same number, so it works with the
+            // squelch switched off.
+            double sum = 0.0;
+            for (int k = 0; k < m; k++)
+                sum += _bi[k] * (double)_bi[k] + _bq[k] * (double)_bq[k];
+
+            float meanPower = (float)(sum / Math.Max(1, m));
+            _squelch.Update(meanPower, m);
+            _levelDb = 10.0f * (float)Math.Log10(Math.Max(meanPower, 1e-20f));
 
             switch (_mode)
             {
@@ -186,34 +244,10 @@ namespace Radiocity.Dsp
             }
 
             if (_agcEnabled) _agc.Process(_audio, m);
+            _squelch.Apply(_audio, m);
 
             Array.Copy(_audio, 0, output, 0, m);
             return m;
-        }
-
-        /// <summary>
-        /// Sizes the anti-alias filter from the actual requirement instead of a
-        /// guessed tap count. Passband ends at half the channel width, stopband
-        /// starts at the new Nyquist; the Kaiser estimate then tells us how many
-        /// taps it takes to get 70 dB of rejection across that gap.
-        /// </summary>
-        private static float[] DesignChannelFilter(double sampleRate, int outputRate, double channelHz, int decimation)
-        {
-            double pass = Math.Min(channelHz * 0.5, outputRate * 0.45) / sampleRate;
-            double stop = 0.5 / decimation;
-
-            // No room for a transition band (wide FM at a high output rate):
-            // fall back to a gentle filter, the sound card itself does the rest.
-            if (stop - pass < 0.002)
-                return FirDesign.LowPass(0.45 / decimation, 63, 8.6);
-
-            double deltaF = stop - pass;
-            int taps = (int)Math.Ceiling(62.0 / (2.285 * 2.0 * Math.PI * deltaF));
-            if (taps < 15) taps = 15;
-            if (taps > 1023) taps = 1023;
-
-            double cutoff = (pass + stop) * 0.5;
-            return FirDesign.LowPass(cutoff, taps, 8.6);
         }
     }
 }

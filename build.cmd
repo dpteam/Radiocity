@@ -24,6 +24,10 @@ if not exist "%CSC%" (
 )
 
 set ICON=%~dp0assets\radiocity.ico
+if not exist "%ICON%" (
+    echo Icon missing. Run: powershell -ExecutionPolicy Bypass -File tools\make-icon.ps1
+    exit /b 1
+)
 
 set FLAGS=/nologo /target:exe /platform:anycpu /unsafe+ /langversion:4 /warn:4
 if /i "%CONFIG%"=="Debug" (
@@ -32,9 +36,12 @@ if /i "%CONFIG%"=="Debug" (
     set FLAGS=%FLAGS% /optimize+
 )
 
+rem The web UI is embedded so Radiocity.exe stays a single file you can copy to
+rem another machine. The resource name is what Page.cs looks up.
 "%CSC%" %FLAGS% ^
     /out:"%OUTDIR%\Radiocity.exe" ^
     /win32icon:"%ICON%" ^
+    /resource:"%~dp0web\index.html",Radiocity.web.index.html ^
     "%~dp0src\Dsp\RingBuffer.cs" ^
     "%~dp0src\Dsp\Nco.cs" ^
     "%~dp0src\Dsp\Fir.cs" ^
@@ -43,9 +50,15 @@ if /i "%CONFIG%"=="Debug" (
     "%~dp0src\Dsp\FmDemod.cs" ^
     "%~dp0src\Dsp\SsbDemod.cs" ^
     "%~dp0src\Dsp\ClockCalib.cs" ^
+    "%~dp0src\Dsp\DecimationChain.cs" ^
+    "%~dp0src\Dsp\Squelch.cs" ^
     "%~dp0src\Dsp\Dcf77.cs" ^
     "%~dp0src\Dsp\Receiver.cs" ^
     "%~dp0src\Audio\WinMM.cs" ^
+    "%~dp0src\Web\HttpServer.cs" ^
+    "%~dp0src\Web\SampleSource.cs" ^
+    "%~dp0src\Web\Page.cs" ^
+    "%~dp0src\Web\WebRadio.cs" ^
     "%~dp0src\App\WavFile.cs" ^
     "%~dp0src\App\Program.cs" ^
     "%~dp0src\App\AssemblyInfo.cs"

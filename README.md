@@ -19,9 +19,11 @@ audio hardware that is already in the machine.
 ```
 AM      : distortion 109.5 dB below tone      (below float32 resolution)
 FM      : residual    62.3 dB below tone
-SSB     : sideband rejection -106.9 dB
+SSB     : sideband rejection -111.1 dB
 CW      : carrier -> 700 Hz beat note
 clock   : 27.0 ppm injected, 26.92 ppm measured
+decim   : 192k -> 12k in 2 stages, 4.6x cheaper than one filter
+squelch : mutes on silence, opens on carrier
 DCF77   : full telegram decoded at -40 and -20 dBFS
 ```
 
@@ -81,6 +83,7 @@ bin\Radiocity.exe dcf77 70 192000 -b24 rem decode the 77.5 kHz time signal
 | `listen <tuneHz> [sec] [mode] [rate] [channelHz]` | Live receive: capture, demodulate, play |
 | `calib <refHz> [sec] [rate]` | Measure the card's clock error in ppm |
 | `dcf77 [sec] [rate]` | Decode the DCF77 time signal at 77.5 kHz |
+| `web [--sim] [--port N]` | Serve the WebSDR UI (waterfall, audio, tuning) |
 
 Modes: `am`, `fm`, `usb`, `lsb`, `cw`. Add `-b8`, `-b16`, `-b24` or `-b32` to
 any command to choose the capture depth; `-b24` is strongly recommended for VLF,
@@ -98,27 +101,37 @@ Radiocity 0.4.0 - a sound card used as an SDR front end
   radiocity listen <tuneHz> [seconds] [am|fm|usb|lsb|cw] [rate] [channelHz]
   radiocity calib <refHz> [seconds] [rate]  measure the card's clock error in ppm
   radiocity dcf77 [seconds] [rate]        decode the 77.5 kHz time signal
+  radiocity web [--sim] [--port N] ...    serve a WebSDR UI on http://localhost:8080
 ```
 
 ## The signal path
 
 ```
-waveIn ──► NCO ──► FIR + decimate ──► demod ──► AGC ──► resample ──► waveOut
-           mix      channel filter    AM/FM/SSB/CW
+waveIn ──► NCO ──► FIR ──► FIR ──► demod ──► AGC ──► squelch ──► resample ──► waveOut
+           mix     ÷8      ÷2      AM/FM/SSB/CW                      or /audio
 ```
+
+Two decimation stages rather than one, because the FIR cost is `taps × rate` and
+the tap count explodes as the transition band narrows: 192 kHz → 12 kHz in one
+step needs 553 taps at 192 kHz (106 M multiply-adds/s), while 192→24→12 needs
+23 M/s for the same rejection. That difference is what makes a narrow CW filter
+affordable on a 2005 CPU.
 
 | Stage | File | The interesting part |
 |---|---|---|
 | Capture | `src/Audio/WinMM.cs` | `waveIn*` P/Invoke; the only API alive on XP, Vista, 7, 8, 10 and 11 |
 | Mixing | `src/Dsp/Nco.cs` | Table lookup with interpolation; phase as a fraction of a turn, so retuning never clicks |
 | Filtering | `src/Dsp/Fir.cs` | Kaiser window; tap count computed from the requirement, not guessed |
+| Decimation | `src/Dsp/DecimationChain.cs` | Multi-stage: 192k→12k in 2 steps costs 4.6× less than one filter for the same result |
 | AM | `src/Dsp/Demod.cs` | Envelope + 20 Hz DC blocker |
 | FM | `src/Dsp/FmDemod.cs` | `atan2` of `z[n]·conj(z[n-1])` — amplitude-independent, so no limiter |
-| SSB/CW | `src/Dsp/SsbDemod.cs` | Phasing method, 127-tap Hilbert, −107 dB rejection |
+| SSB/CW | `src/Dsp/SsbDemod.cs` | Phasing method, 127-tap Hilbert, −111 dB rejection |
 | AGC | `src/Dsp/Demod.cs` | RMS detector, asymmetric *gain slew* (not an asymmetric detector) |
+| Squelch | `src/Dsp/Squelch.cs` | Hysteresis on channel power, measured before the AGC |
 | Resampling | `src/Dsp/Demod.cs` | Catmull-Rom; linear interpolation would droop 3.3 dB at 5 kHz |
 | Clock | `src/Dsp/ClockCalib.cs` | FFT peak + parabolic refinement + Goertzel sweep, under 1 ppm |
 | DCF77 | `src/Dsp/Dcf77.cs` | 100/200 ms dip widths, BCD telegram, three parity bits |
+| Web | `src/Web/` | `TcpListener` + hand-rolled HTTP/1.1, waterfall + chunked audio |
 
 Full explanation in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -133,6 +146,8 @@ Full explanation in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | SSB rejection | < −50 dB | a phasing receiver is judged by this and nothing else |
 | CW | 700 Hz beat note at target level | proves the BFO shift works |
 | Clock | within 1.5 ppm | 1 ppm at 192 kHz is 0.19 Hz |
+| Decimation | chain output matches, split multiplies back | proves the cheap path is the same path |
+| Squelch | mutes at 0.6 s, opens at 1.6 s, mutes at 2.6 s | follows the signal, not the block |
 | Resampler | amplitude within 2%, > 30 dB | a bad interpolator is audible as dullness |
 | DCF77 | full frame at −40 and −20 dBFS | the second one is a noisy city, not a lab |
 
@@ -184,6 +199,8 @@ and why.
 build.cmd                    one-command build with the in-box csc.exe
 src/Audio/WinMM.cs           waveIn/waveOut P/Invoke
 src/Dsp/                     the entire signal processing chain
+src/Web/                     HTTP server, WebSDR endpoints, synthetic source
+web/index.html               the UI, embedded into the exe as a resource
 src/App/                     CLI, WAV reader/writer, assembly info
 tools/make-icon.ps1          generates assets/radiocity.ico (reproducible, not hand-drawn)
 docs/ARCHITECTURE.md         how it works and why each stage is built that way
@@ -194,19 +211,56 @@ docs/HARDWARE.md             antennas and downconverters, by budget
 
 ## Status
 
-Working: capture and playback, AM, FM, USB, LSB, CW, AGC, spectrum, offline
-demodulation, clock calibration, DCF77 decoding, 8/16/24/32-bit capture.
+Working: capture and playback, AM, FM, USB, LSB, CW, AGC, squelch, spectrum,
+offline demodulation, clock calibration, DCF77 decoding, 8/16/24/32-bit capture,
+multi-stage decimation, and a **WebSDR front end**.
 
 Not yet:
 
-- [ ] WebSDR front end — `HttpListener` + waterfall + audio stream. Note that
-      .NET 4.0 has no `WebSockets` (that is 4.5), so long-poll, SSE, or a custom
-      framing over TCP.
-- [ ] A second decimation stage for real CW selectivity — right now the channel
-      filter is ~3 kHz, so a CW note is audible but noisy.
-- [ ] Squelch / noise blanker.
 - [ ] I/Q recording to file, so the air can be analysed offline.
+- [ ] Noise blanker (impulse rejection) — the squelch handles "no signal", not
+      "signal buried in clicks".
 - [ ] RSDN-20 and SAQ decoders.
+- [ ] Multiple simultaneous listeners with independent tuning (one receiver,
+      one tuning today; clients share it).
+
+## WebSDR
+
+```cmd
+bin\Radiocity.exe web --sim
+```
+
+Then open <http://localhost:8080/>. `--sim` serves a synthetic band with five
+AM carriers, so the UI can be developed and tested on a machine with no audio
+input at all — which is also how CI would exercise it.
+
+With a real card:
+
+```cmd
+bin\Radiocity.exe web --rate 192000 --freq 77500 --mode am --port 8080
+```
+
+| Option | Meaning |
+|---|---|
+| `--sim` | synthetic source instead of the sound card |
+| `--port N` | HTTP port, default 8080 |
+| `--rate N` | capture rate, default 48000 |
+| `--freq N` | initial tuning in Hz |
+| `--mode M` | `am`, `fm`, `usb`, `lsb`, `cw` |
+| `--bits N` | capture depth (same as `-b24`) |
+
+Endpoints: `/` (UI), `/waterfall?from=N` (raw spectrum columns),
+`/state` (JSON), `/tune` (POST), `/audio` (chunked 16-bit PCM at 48 kHz).
+
+Two constraints shaped this:
+
+- **`HttpListener` needs admin rights on XP** because it sits on `http.sys`, so
+  the server is a plain `TcpListener` with hand-rolled HTTP/1.1. It supports
+  keep-alive, query strings, form bodies and chunked streaming — enough for a
+  WebSDR and nothing more.
+- **.NET 4.0 has no `WebSockets`** (that is 4.5), so audio is a chunked HTTP
+  stream decoded with `fetch` + `ReadableStream`, and the waterfall is polled.
+  Both work in any browser that can run the page at all.
 
 ## License
 

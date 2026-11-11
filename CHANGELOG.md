@@ -7,11 +7,49 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Planned
-- WebSDR front end (`HttpListener`, waterfall, audio stream)
-- Second decimation stage for real CW selectivity
-- Squelch and noise blanker
 - I/Q recording to file
+- Noise blanker (impulse rejection)
 - RSDN-20 and SAQ decoders
+- Multiple simultaneous listeners with independent tuning
+
+## [0.5.0] - 2026-11-12
+
+The version where it becomes something you can point a browser at.
+
+### Added
+- **WebSDR front end** (`radiocity web`) — waterfall, click-to-tune, mode
+  switching, bandwidth, squelch, live audio. The UI is embedded in the exe as a
+  resource, so the build stays a single file.
+- **Hand-rolled HTTP/1.1 server** over `TcpListener`: keep-alive, query strings,
+  form bodies, chunked streaming. `HttpListener` was rejected because it sits on
+  `http.sys` and needs administrator rights on XP.
+- **Multi-stage decimation** (`DecimationChain`) — 192 kHz → 12 kHz in two steps
+  costs 23 M multiply-adds/s instead of 106 M for the same rejection, a 4.6×
+  saving that is what makes narrow CW filters affordable.
+- **Squelch** with hysteresis on channel power, measured before the AGC, with a
+  smooth 2 ms / 40 ms gate so it does not click.
+- **Synthetic band source** (`--sim`) — five AM carriers at known frequencies, so
+  the web UI and the whole receive path can be exercised on a machine with no
+  audio input at all.
+- Channel power meter, independent of the squelch state.
+- CW channel narrowed from 3 kHz to 500 Hz; SSB from 3 kHz to 2.4 kHz.
+
+### Fixed
+- **Squelch reacted thousands of times too slowly.** The smoothing coefficient
+  was computed per sample and applied once per block, so an 8192-sample block
+  made the detector a memory rather than a filter. The coefficient is now
+  derived from the block length.
+- **The waterfall never produced a column.** It took "the last N samples of the
+  block" for the FFT, but a live source delivers a few hundred samples at a
+  time, so the condition never held. Samples are now accumulated until a full
+  frame is available.
+- **The server died on the first audio request.** `Encoding.GetBytes` was called
+  with a character count longer than the string, and the resulting exception on
+  a pool thread terminated the process. Also fixed: stream handlers are now
+  wrapped, and an unhandled-exception handler reports rather than vanishing.
+- Level meter read −200 dBFS when the squelch was off, because it shared the
+  squelch's (disabled) power estimate.
+- A squelch that was configured now starts muted instead of open.
 
 ## [0.4.0] - 2026-11-11
 
