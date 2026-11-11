@@ -235,6 +235,14 @@
     </div>
 
     <div class="card">
+      <label>Noise blanker <b><span id="nbOut">off</span></b></label>
+      <label style="display:flex;gap:8px;align-items:center;text-transform:none;letter-spacing:0;font-size:13px;color:var(--text);margin:0">
+        <input type="checkbox" id="nbToggle" style="width:auto;margin:0">
+        remove impulse noise
+      </label>
+    </div>
+
+    <div class="card">
       <label>Level <b><span id="lvlOut">—</span> dBFS</b></label>
       <div class="meter"><i id="lvlBar"></i></div>
     </div>
@@ -349,8 +357,10 @@
 
     var bw = document.getElementById("bwRange").value;
     var sq = document.getElementById("sqRange").value;
+    var nb = document.getElementById("nbToggle").checked;
     var body = "f=" + f + "&mode=" + state.mode.toLowerCase() + "&bw=" + bw;
     if (sq > -120) body += "&squelch=" + sq;
+    body += "&blank=" + (nb ? 12 : 0);
 
     fetch("/tune", {
       method: "POST",
@@ -369,6 +379,14 @@
     var badge = document.getElementById("squelchBadge");
     if (s.open === false) { badge.className = "badge"; badge.textContent = "muted"; }
     else { badge.className = "badge on"; badge.textContent = "squelch"; }
+
+    // Reflect the server's blanker state, so a reloaded page is not lying.
+    if (typeof s.blank === "number") {
+      var on = s.blank > 0;
+      var box = document.getElementById("nbToggle");
+      if (box.checked !== on) box.checked = on;
+      document.getElementById("nbOut").textContent = on ? "on" : "off";
+    }
   }
 
   function updateLevel(db) {
@@ -409,6 +427,12 @@
     document.getElementById("sqOut").textContent = v <= -120 ? "off" : v + " dB";
   });
   document.getElementById("sqRange").addEventListener("change", function () {
+    pendingFreq = state.freq;
+    sendTune();
+  });
+
+  document.getElementById("nbToggle").addEventListener("change", function () {
+    document.getElementById("nbOut").textContent = this.checked ? "on" : "off";
     pendingFreq = state.freq;
     sendTune();
   });

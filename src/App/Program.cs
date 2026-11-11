@@ -21,6 +21,12 @@ namespace Radiocity.App
         /// </summary>
         private static int CaptureBits = 16;
 
+        /// <summary>
+        /// Impulse blanker threshold, set with -nb. Null keeps it off, which is
+        /// the right default: on a clean signal a blanker can only do harm.
+        /// </summary>
+        private static float? BlankerThreshold;
+
         private static int Main(string[] args)
         {
             // A pool thread that throws takes the whole process down. Say why,
@@ -74,6 +80,13 @@ namespace Radiocity.App
                 else if (a == "-b16") CaptureBits = 16;
                 else if (a == "-b24") CaptureBits = 24;
                 else if (a == "-b32") CaptureBits = 32;
+                else if (a == "-nb") BlankerThreshold = 12.0f;
+                else if (a.StartsWith("-nb") && a.Length > 3)
+                {
+                    float t;
+                    if (float.TryParse(a.Substring(3), NumberStyles.Float, Inv, out t)) BlankerThreshold = t;
+                    else rest.Add(args[i]);
+                }
                 else rest.Add(args[i]);
             }
 
@@ -112,6 +125,7 @@ namespace Radiocity.App
             Console.WriteLine();
             Console.WriteLine("  rate defaults to 48000; 192000 reaches to 96 kHz and is required for DCF77.");
             Console.WriteLine("  add -b24 (or -b8/-b16/-b32) to any command to pick the capture depth.");
+            Console.WriteLine("  add -nb to enable the impulse noise blanker (-nb20 for a looser threshold).");
             Console.WriteLine("  add --sim to 'web' to serve a synthetic band, no sound card needed.");
             Console.WriteLine();
             Console.WriteLine("  Reality check: a sound card ADC stops at its own sample rate, so it hears");
@@ -793,17 +807,22 @@ namespace Radiocity.App
 
         private static ReceiverOptions ParseOptions(string mode, double channelHz, int decim)
         {
+            ReceiverOptions o;
+
             switch (mode.ToLowerInvariant())
             {
-                case "fm": return ReceiverOptions.Fm(decim);
-                case "usb": return ReceiverOptions.Ssb(true, decim);
-                case "lsb": return ReceiverOptions.Ssb(false, decim);
-                case "cw": return ReceiverOptions.Cw(700.0, decim);
+                case "fm": o = ReceiverOptions.Fm(decim); break;
+                case "usb": o = ReceiverOptions.Ssb(true, decim); break;
+                case "lsb": o = ReceiverOptions.Ssb(false, decim); break;
+                case "cw": o = ReceiverOptions.Cw(700.0, decim); break;
                 default:
-                    ReceiverOptions o = ReceiverOptions.Am(decim);
+                    o = ReceiverOptions.Am(decim);
                     if (channelHz > 0.0) o.ChannelHz = channelHz;
-                    return o;
+                    break;
             }
+
+            o.BlankerThreshold = BlankerThreshold;
+            return o;
         }
 
         // ================================================================ spectrum
@@ -1142,6 +1161,7 @@ namespace Radiocity.App
                 else if (a == "--rate" && i + 1 < args.Length) rate = int.Parse(args[++i], Inv);
                 else if (a == "--freq" && i + 1 < args.Length) freq = double.Parse(args[++i], Inv);
                 else if (a == "--bits" && i + 1 < args.Length) bits = int.Parse(args[++i], Inv);
+                else if (a == "--blank" && i + 1 < args.Length) BlankerThreshold = float.Parse(args[++i], Inv);
                 else if (a == "--mode" && i + 1 < args.Length) mode = ParseMode(args[++i]);
             }
 
@@ -1169,6 +1189,8 @@ namespace Radiocity.App
             using (WebRadio radio = new WebRadio(source, freq, mode, DefaultChannel(mode)))
             using (HttpServer server = new HttpServer(port, radio.Handle))
             {
+                if (BlankerThreshold.HasValue) radio.SetBlanker(BlankerThreshold);
+
                 source.Start();
                 radio.Start();
                 server.Start();

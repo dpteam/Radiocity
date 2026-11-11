@@ -46,6 +46,7 @@ namespace Radiocity.Web
         private DemodMode _mode;
         private double _channelHz;
         private float? _squelchDb;
+        private float? _blankerThreshold;
         private int _generation;
 
         private readonly List<AudioClient> _clients = new List<AudioClient>();
@@ -128,6 +129,13 @@ namespace Radiocity.Web
                 _squelchDb = squelchDb;
             }
 
+            Interlocked.Increment(ref _generation);
+        }
+
+        /// <summary>Impulse blanker threshold; null switches it off.</summary>
+        public void SetBlanker(float? threshold)
+        {
+            lock (_configLock) _blankerThreshold = threshold;
             Interlocked.Increment(ref _generation);
         }
 
@@ -258,6 +266,7 @@ namespace Radiocity.Web
                     DemodMode mode;
                     double channel;
                     float? squelch;
+                    float? blanker;
                     double freq;
 
                     lock (_configLock)
@@ -265,6 +274,7 @@ namespace Radiocity.Web
                         mode = _mode;
                         channel = _channelHz;
                         squelch = _squelchDb;
+                        blanker = _blankerThreshold;
                         freq = _freq;
                     }
 
@@ -274,6 +284,7 @@ namespace Radiocity.Web
                     options.Mode = mode;
                     options.ChannelHz = channel;
                     options.SquelchDb = squelch;
+                    options.BlankerThreshold = blanker;
                     if (mode == DemodMode.Fm)
                     {
                         options.DeviationHz = 75000.0;
@@ -451,6 +462,12 @@ namespace Radiocity.Web
             sb.Append("\"rate\":").Append(_rate).Append(',');
             sb.Append("\"level\":").Append(LevelDb.ToString("F1", CultureInfo.InvariantCulture)).Append(',');
             sb.Append("\"open\":").Append(SquelchOpen ? "true" : "false").Append(',');
+
+            float? blanker = CurrentBlanker;
+            sb.Append("\"blank\":").Append(blanker.HasValue
+                ? blanker.Value.ToString("F0", CultureInfo.InvariantCulture)
+                : "0").Append(',');
+
             sb.Append("\"columns\":").Append(ColumnsTotal);
             sb.Append('}');
 
@@ -466,6 +483,7 @@ namespace Radiocity.Web
             string modeText = req.Get("mode");
             double channel = req.GetDouble("bw", ChannelHz);
             string squelchText = req.Get("squelch");
+            string blankText = req.Get("blank");
 
             DemodMode mode = Mode;
             if (!string.IsNullOrEmpty(modeText))
@@ -488,6 +506,16 @@ namespace Radiocity.Web
                     squelch = sv;
             }
 
+            float? blanker;
+            lock (_configLock) blanker = _blankerThreshold;
+
+            if (!string.IsNullOrEmpty(blankText))
+            {
+                float bv;
+                if (float.TryParse(blankText, NumberStyles.Float, CultureInfo.InvariantCulture, out bv))
+                    blanker = (bv > 0.0f) ? (float?)bv : null;
+            }
+
             // Clamp inside what the card can actually see.
             double limit = _rate * 0.5 - 500.0;
             if (freq < 0.0) freq = 0.0;
@@ -499,7 +527,15 @@ namespace Radiocity.Web
             if (needsRebuild) Configure(mode, channel, squelch);
             else if (!string.IsNullOrEmpty(squelchText)) SetSquelch(squelch);
 
+            if (!Nullable.Equals(blanker, CurrentBlanker)) SetBlanker(blanker);
+
             return HandleState();
+        }
+
+        /// <summary>Current blanker threshold, null when off.</summary>
+        public float? CurrentBlanker
+        {
+            get { lock (_configLock) return _blankerThreshold; }
         }
 
         private HttpResponse HandleAudio()
