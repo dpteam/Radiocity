@@ -195,6 +195,7 @@
     <button data-mode="cw">CW</button>
   </div>
   <div class="row" style="margin-left:auto">
+    <span class="badge" id="sessBadge">1 receiver</span>
     <span class="badge" id="squelchBadge">squelch</span>
     <button id="audioBtn" class="primary">▶ Listen</button>
   </div>
@@ -269,6 +270,18 @@
   var state = { freq: 0, mode: "AM", channel: 9000 };
   var polling = true;
 
+  // Each browser gets its own receiver on the server. The id comes back in the
+  // first /state response and is echoed on every request after that; without it
+  // everyone would share the "default" session and fight over the dial.
+  var sid = null;
+
+  function url(path, params) {
+    var sep = path.indexOf("?") >= 0 ? "&" : "?";
+    var q = params ? sep + params : "";
+    if (sid) q += (q ? "&" : sep) + "sid=" + encodeURIComponent(sid);
+    return path + q;
+  }
+
   // ---------------------------------------------------------------- palette
 
   var palette = new Array(256);
@@ -298,7 +311,7 @@
   function poll() {
     if (!polling) return;
 
-    fetch("/waterfall?from=" + nextFrom, { cache: "no-store" })
+    fetch(url("/waterfall", "from=" + nextFrom), { cache: "no-store" })
       .then(function (res) {
         var next = res.headers.get("X-Next-From");
         var bins = parseInt(res.headers.get("X-Bins") || "256", 10);
@@ -362,23 +375,35 @@
     if (sq > -120) body += "&squelch=" + sq;
     body += "&blank=" + (nb ? 12 : 0);
 
-    fetch("/tune", {
+    fetch(url("/tune"), {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: body
     })
-      .then(function (r) { return r.json(); })
+      .then(function (r) {
+        if (r.status === 503) {
+          return r.text().then(function (t) { throw new Error(t); });
+        }
+        return r.json();
+      })
       .then(applyState)
       .catch(function (e) { showError("tune failed: " + e.message); });
   }
 
   function applyState(s) {
     if (!s) return;
+    if (s.sid && !sid) sid = s.sid;
     if (s.rate) { rate = s.rate; updateAxis(); }
     if (typeof s.level === "number") updateLevel(s.level);
+
     var badge = document.getElementById("squelchBadge");
     if (s.open === false) { badge.className = "badge"; badge.textContent = "muted"; }
     else { badge.className = "badge on"; badge.textContent = "squelch"; }
+
+    if (typeof s.sessions === "number") {
+      document.getElementById("sessBadge").textContent =
+        s.sessions + (s.sessions === 1 ? " receiver" : " receivers");
+    }
 
     // Reflect the server's blanker state, so a reloaded page is not lying.
     if (typeof s.blank === "number") {
@@ -512,7 +537,7 @@
   function pump() {
     if (!pumping) return;
 
-    fetch("/audio", { cache: "no-store" })
+    fetch(url("/audio"), { cache: "no-store" })
       .then(function (res) {
         if (!res.ok) throw new Error("HTTP " + res.status);
         if (!res.body || !res.body.getReader) {
@@ -577,11 +602,16 @@
 
   updateAxis();
   document.querySelector('#modes button[data-mode="am"]').className = "active";
-  poll();
+
+  // Claim a session before anything else, then start the waterfall with it.
+  fetch("/state", { cache: "no-store" })
+    .then(function (r) { return r.json(); })
+    .then(function (s) { applyState(s); poll(); })
+    .catch(function () { poll(); });
 
   // Keep the meter and squelch badge alive even while idle.
   setInterval(function () {
-    fetch("/state", { cache: "no-store" })
+    fetch(url("/state"), { cache: "no-store" })
       .then(function (r) { return r.json(); })
       .then(applyState)
       .catch(function () { });

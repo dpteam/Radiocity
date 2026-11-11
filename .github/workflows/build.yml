@@ -71,43 +71,67 @@ jobs:
           $proc = Start-Process -FilePath "bin\Radiocity.exe" -ArgumentList "web","--sim","--port","8099","--rate","48000" -PassThru -WindowStyle Hidden -RedirectStandardOutput "web-test.log" -RedirectStandardError "web-test.err"
 
           try {
+            # Readiness via a raw socket, not Invoke-WebRequest: on a machine
+            # with proxy auto-detection the first HTTP request can take seconds
+            # before it even reaches localhost, and that is not a server bug.
             $ok = $false
-            for ($i = 0; $i -lt 40; $i++) {
+            for ($i = 0; $i -lt 60; $i++) {
               Start-Sleep -Milliseconds 250
               try {
-                Invoke-WebRequest "http://localhost:8099/state" -UseBasicParsing -TimeoutSec 2 | Out-Null
+                $probe = New-Object System.Net.Sockets.TcpClient
+                $probe.Connect("127.0.0.1", 8099)
+                $probe.Close()
                 $ok = $true
                 break
+              } catch { }
+            }
+            if (-not $ok) { throw "server did not open port 8099" }
+
+            $state = $null
+            for ($i = 0; $i -lt 20; $i++) {
+              try {
+                $state = Invoke-RestMethod "http://localhost:8099/state" -TimeoutSec 10
+                break
               } catch {
-                if ($i -eq 39) { Write-Host "last attempt failed: $($_.Exception.Message)" }
+                Start-Sleep -Milliseconds 250
               }
             }
-            if (-not $ok) { throw "server did not come up" }
+            if ($null -eq $state) { throw "GET /state never answered" }
 
-            $state = Invoke-RestMethod "http://localhost:8099/state"
             if ($state.rate -ne 48000) { throw "unexpected rate: $($state.rate)" }
             Write-Host "state: $($state | ConvertTo-Json -Compress)"
 
-            $ui = Invoke-WebRequest "http://localhost:8099/" -UseBasicParsing
+            $ui = Invoke-WebRequest "http://localhost:8099/" -UseBasicParsing -TimeoutSec 10
             if ($ui.Content -notmatch '<title>Radiocity</title>') { throw "UI did not serve the embedded page" }
             Write-Host "UI: $($ui.RawContentLength) bytes"
 
-            $wf = Invoke-WebRequest "http://localhost:8099/waterfall?from=0" -UseBasicParsing
+            $wf = Invoke-WebRequest "http://localhost:8099/waterfall?from=0" -UseBasicParsing -TimeoutSec 10
             if ($wf.RawContentLength -lt 256) { throw "waterfall returned no columns" }
             Write-Host "waterfall: $($wf.RawContentLength) bytes, next=$($wf.Headers['X-Next-From'])"
 
-            $tuned = Invoke-RestMethod "http://localhost:8099/tune" -Method POST -Body "f=3000&mode=cw&bw=500"
+            $tuned = Invoke-RestMethod "http://localhost:8099/tune" -Method POST -Body "f=3000&mode=cw&bw=500" -TimeoutSec 10
             if ($tuned.freq -ne 3000) { throw "tune did not take effect" }
             if ($tuned.mode -ne "CW") { throw "mode switch did not take effect" }
             Write-Host "tuned: $($tuned | ConvertTo-Json -Compress)"
 
             # The blanker has to survive the round trip through the HTTP layer,
             # not just work as a class.
-            $on = Invoke-RestMethod "http://localhost:8099/tune" -Method POST -Body "f=3000&mode=am&bw=6000&blank=12"
+            $on = Invoke-RestMethod "http://localhost:8099/tune" -Method POST -Body "f=3000&mode=am&bw=6000&blank=12" -TimeoutSec 10
             if ($on.blank -ne 12) { throw "blanker did not switch on (got $($on.blank))" }
-            $off = Invoke-RestMethod "http://localhost:8099/tune" -Method POST -Body "f=3000&mode=am&bw=6000&blank=0"
+            $off = Invoke-RestMethod "http://localhost:8099/tune" -Method POST -Body "f=3000&mode=am&bw=6000&blank=0" -TimeoutSec 10
             if ($off.blank -ne 0) { throw "blanker did not switch off (got $($off.blank))" }
             Write-Host "blanker: on and off both accepted"
+
+            # Two listeners must be able to sit on different frequencies at the
+            # same time. This is the whole point of per-session receivers.
+            $a = Invoke-RestMethod "http://localhost:8099/tune?sid=alpha" -Method POST -Body "f=3000&mode=am&bw=6000" -TimeoutSec 10
+            $b = Invoke-RestMethod "http://localhost:8099/tune?sid=bravo" -Method POST -Body "f=18000&mode=am&bw=6000" -TimeoutSec 10
+            $a2 = Invoke-RestMethod "http://localhost:8099/state?sid=alpha" -TimeoutSec 10
+            $b2 = Invoke-RestMethod "http://localhost:8099/state?sid=bravo" -TimeoutSec 10
+            if ($a2.freq -ne 3000) { throw "session alpha moved to $($a2.freq)" }
+            if ($b2.freq -ne 18000) { throw "session bravo moved to $($b2.freq)" }
+            if ($a2.sessions -lt 3) { throw "expected at least 3 sessions, got $($a2.sessions)" }
+            Write-Host "independent tuning: alpha=$($a2.freq) Hz, bravo=$($b2.freq) Hz, $($a2.sessions) sessions"
 
             # Audio must actually stream PCM, not just answer 200. Read against a
             # time budget rather than an iteration count: chunked responses
@@ -116,12 +140,12 @@ jobs:
             $client.Connect("127.0.0.1", 8099)
             $stream = $client.GetStream()
             $stream.ReadTimeout = 8000
-            $req = [Text.Encoding]::ASCII.GetBytes("GET /audio HTTP/1.1`r`nHost: localhost`r`n`r`n")
+            $req = [Text.Encoding]::ASCII.GetBytes("GET /audio?sid=bravo HTTP/1.1`r`nHost: localhost`r`n`r`n")
             $stream.Write($req, 0, $req.Length)
 
             $buffer = New-Object byte[] 8192
             $total = 0
-            $deadline = (Get-Date).AddSeconds(5)
+            $deadline = (Get-Date).AddSeconds(8)
             while ((Get-Date) -lt $deadline -and $total -lt 16384) {
               $n = $stream.Read($buffer, 0, 8192)
               if ($n -le 0) { break }

@@ -201,13 +201,22 @@ demodulation half of the chain, callable on already-mixed I/Q.
 
 ## The web layer — `src/Web/`
 
-One receiver, many listeners. The DSP runs whether anyone is connected or not;
-audio clients attach and detach, and the waterfall keeps rolling.
+One capture, many receivers. The card can only be opened once, so exactly one
+thread reads it and fans each raw block out to every session.
 
 ```
-ISampleSource ──► WebRadio (DSP thread) ──┬──► per-client RingBuffer ──► /audio
-   waveIn or synthetic                    └──► spectrum columns ──────► /waterfall
+ISampleSource ──► CaptureHub ──┬──► RadioSession ──► per-client ring ──► /audio
+   waveIn or synthetic          ├──► RadioSession ──► ...
+   one thread                   └──► spectrum columns ─────────────────► /waterfall
 ```
+
+**`CaptureHub`** owns the source and the waterfall. The spectrum of the band is
+the same for every listener, so it is computed once, on the capture thread.
+
+**`RadioSession`** owns everything downstream of the mixer: NCO, decimation
+chain, demodulator, AGC, squelch, blanker. Its own thread, so a session that
+asked for a narrow filter does more work than one listening wide and they
+degrade independently instead of the slowest setting the latency for everybody.
 
 **Why not `HttpListener`:** it is a wrapper over `http.sys`, and registering a
 URL prefix requires administrator rights on Windows XP. Since XP is an explicit
@@ -221,14 +230,25 @@ and chunked streaming — the minimum a WebSDR needs.
 since a watermark. A slow client gets the columns it missed in one response
 instead of silently dropping them.
 
-**Blocking writes are the clock.** The DSP thread calls `Broadcast`, which never
-blocks; a client that falls behind has its oldest audio dropped so latency stays
-bounded. The HTTP thread blocks in `Drain` waiting for samples, which paces it to
-real time without a timer.
+**Sessions.** An opaque id, kept in a page variable and appended to every
+request. No cookies: they need parsing, expiry and a conversation about consent,
+and a query parameter does the same job. No id means the `default` session, so
+`curl http://host/state` works. Idle sessions are reaped after five minutes.
 
-**FFT length is chosen from the sample rate** (`PickFftSize`) so the waterfall
-runs at about 25 columns per second at 48 kHz and at 192 kHz alike. A fixed
-2048-point FFT would scroll four times too fast at 192 kHz.
+**The ceiling is real.** N listeners means N FIR chains — 23 M multiply-adds/s
+each at 192 kHz. The server caps sessions at 8 and returns `503` past that
+rather than quietly degrading everyone, because "it works" and "it works for
+eight people at once" are different claims.
+
+**Blocking writes are the clock.** A session's DSP thread never blocks on a
+client: a listener that falls behind has its oldest audio dropped so latency
+stays bounded. The HTTP thread blocks in `Drain` waiting for samples, which
+paces it to real time without a timer. An abandoned connection is detected by
+ten seconds of silence, so a closed tab cannot hold a pool thread forever.
+
+**FFT length is chosen from the sample rate** (`CaptureHub.PickFftSize`) so the
+waterfall runs at about 25 columns per second at 48 kHz and at 192 kHz alike. A
+fixed 2048-point FFT would scroll four times too fast at 192 kHz.
 
 ## Performance notes
 

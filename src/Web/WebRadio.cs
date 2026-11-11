@@ -9,416 +9,153 @@ using Radiocity.Dsp;
 namespace Radiocity.Web
 {
     /// <summary>
-    /// The shared receiver behind the web front end: one DSP thread, one tuning,
-    /// many listeners.
+    /// The web front end: a shared capture, one receiver per listener, and the
+    /// HTTP endpoints that tie them together.
     ///
-    /// This is the difference between "a program you operate" and "a server you
-    /// tune": the receiver runs whether anyone is listening or not, audio clients
-    /// attach and detach, and the waterfall keeps rolling. Every client gets its
-    /// own ring buffer, so a slow browser cannot stall the DSP thread.
+    /// Sessions are identified by an opaque id the browser keeps in a variable and
+    /// appends to every request. No cookies: they would need parsing, expiry
+    /// rules and a whole argument about consent, and a query parameter does the
+    /// same job in one line.
+    ///
+    /// A request without an id gets the "default" session. That keeps a bare
+    /// <c>curl http://host/state</c> useful and means a client that forgets to
+    /// keep its id still gets a working receiver rather than an error.
     /// </summary>
     public sealed class WebRadio : IDisposable
     {
-        public const int AudioRate = 48000;
-        public const int Bins = 256;
-        private const int MaxColumns = 512;
+        public const int MaxSessions = 8;
+        private const string DefaultSessionId = "default";
+        private static readonly TimeSpan SessionIdleTimeout = TimeSpan.FromMinutes(5);
 
-        /// <summary>
-        /// FFT length is chosen from the sample rate so the waterfall always runs
-        /// at roughly 25 columns per second. A fixed 2048-point FFT is 42 ms per
-        /// column at 48 kHz but 10 ms at 192 kHz, which scrolls far too fast.
-        /// </summary>
-        private static int PickFftSize(int rate)
-        {
-            int target = rate / 25;
-            int size = 1024;
-            while (size < target && size < 16384) size <<= 1;
-            return size;
-        }
+        private readonly CaptureHub _hub;
+        private readonly Dictionary<string, RadioSession> _sessions =
+            new Dictionary<string, RadioSession>(StringComparer.Ordinal);
+        private readonly object _sessionsLock = new object();
 
-        private readonly ISampleSource _source;
-        private readonly int _rate;
+        private readonly double _initialFreq;
+        private readonly DemodMode _initialMode;
+        private readonly double _initialChannel;
+        private float? _initialBlanker;
 
-        // Configuration, guarded by _configLock. Frequency alone can change
-        // without a rebuild; mode and bandwidth need a new Receiver.
-        private readonly object _configLock = new object();
-        private double _freq;
-        private DemodMode _mode;
-        private double _channelHz;
-        private float? _squelchDb;
-        private float? _blankerThreshold;
-        private int _generation;
-
-        private readonly List<AudioClient> _clients = new List<AudioClient>();
-        private readonly object _clientsLock = new object();
-
-        private readonly byte[][] _columns = new byte[MaxColumns][];
-        private long _columnsTotal;
-        private readonly object _columnsLock = new object();
-
-        private readonly float[] _window;
-        private readonly float[] _re;
-        private readonly float[] _im;
-        private readonly float[] _fftBuf;
-        private int _fftFill;
-        private readonly int _fftSize;
-
-        private Thread _thread;
-        private volatile bool _running;
-        private volatile float _levelDb = -120.0f;
-        private volatile bool _squelchOpen = true;
+        private Timer _reaper;
         private bool _disposed;
 
         public WebRadio(ISampleSource source, double initialFreq, DemodMode mode, double channelHz)
         {
-            _source = source;
-            _rate = source.SampleRate;
+            _hub = new CaptureHub(source);
 
-            _freq = initialFreq;
-            _mode = mode;
-            _channelHz = channelHz;
+            _initialFreq = initialFreq;
+            _initialMode = mode;
+            _initialChannel = channelHz;
 
-            _fftSize = PickFftSize(_rate);
-            _window = Fft.Hann(_fftSize);
-            _re = new float[_fftSize];
-            _im = new float[_fftSize];
-            _fftBuf = new float[_fftSize];
-
-            for (int i = 0; i < MaxColumns; i++) _columns[i] = new byte[Bins];
+            // The default session exists from the start, so /state answers
+            // immediately and the console banner can report real settings.
+            GetOrCreate(DefaultSessionId);
         }
 
-        public int SampleRate { get { return _rate; } }
+        public int SampleRate { get { return _hub.SampleRate; } }
 
-        public double Frequency { get { lock (_configLock) return _freq; } }
-        public DemodMode Mode { get { lock (_configLock) return _mode; } }
-        public double ChannelHz { get { lock (_configLock) return _channelHz; } }
-        public float LevelDb { get { return _levelDb; } }
-        public bool SquelchOpen { get { return _squelchOpen; } }
+        /// <summary>Settings of the default session, for the startup banner.</summary>
+        public DemodMode Mode { get { return GetOrCreate(DefaultSessionId).Mode; } }
+        public double Frequency { get { return GetOrCreate(DefaultSessionId).Frequency; } }
+        public double ChannelHz { get { return GetOrCreate(DefaultSessionId).ChannelHz; } }
+
+        public int SessionCount { get { lock (_sessionsLock) return _sessions.Count; } }
+        public double TotalFilterCost { get { return _hub.TotalFilterCost; } }
 
         public void Start()
         {
-            _running = true;
+            _hub.Start();
 
-            _thread = new Thread(Run);
-            _thread.IsBackground = true;
-            _thread.Name = "dsp";
-            _thread.Start();
+            // Sessions whose browser tab was closed without saying goodbye would
+            // otherwise hold a receiver thread for the life of the process.
+            _reaper = new Timer(Reap, null, 60000, 60000);
         }
 
         public void Stop()
         {
-            _running = false;
-            if (_thread != null) _thread.Join(2000);
-        }
+            if (_reaper != null) { _reaper.Dispose(); _reaper = null; }
+            _hub.Stop();
 
-        // ------------------------------------------------------------ control
-
-        /// <summary>Frequency changes do not need a new receiver, only a new NCO increment.</summary>
-        public void Tune(double hz)
-        {
-            lock (_configLock) _freq = hz;
-        }
-
-        /// <summary>Mode or bandwidth change: the DSP thread rebuilds its chain.</summary>
-        public void Configure(DemodMode mode, double channelHz, float? squelchDb)
-        {
-            lock (_configLock)
+            lock (_sessionsLock)
             {
-                _mode = mode;
-                _channelHz = channelHz;
-                _squelchDb = squelchDb;
+                foreach (KeyValuePair<string, RadioSession> kv in _sessions) kv.Value.Dispose();
+                _sessions.Clear();
             }
-
-            Interlocked.Increment(ref _generation);
         }
 
-        /// <summary>Impulse blanker threshold; null switches it off.</summary>
         public void SetBlanker(float? threshold)
         {
-            lock (_configLock) _blankerThreshold = threshold;
-            Interlocked.Increment(ref _generation);
+            _initialBlanker = threshold;
+            GetOrCreate(DefaultSessionId).Configure(
+                _initialMode, _initialChannel, null, threshold);
         }
 
-        public void SetSquelch(float? squelchDb)
+        // ------------------------------------------------------------ sessions
+
+        private RadioSession GetOrCreate(string id)
         {
-            lock (_configLock) _squelchDb = squelchDb;
-            Interlocked.Increment(ref _generation);
-        }
-
-        // ------------------------------------------------------------ clients
-
-        internal sealed class AudioClient
-        {
-            public RingBuffer Ring = new RingBuffer(1 << 17);
-            public volatile bool Closed;
-        }
-
-        public AudioClientHandle Attach()
-        {
-            AudioClient client = new AudioClient();
-            lock (_clientsLock) _clients.Add(client);
-            return new AudioClientHandle(this, client);
-        }
-
-        private void Detach(AudioClient client)
-        {
-            client.Closed = true;
-            lock (_clientsLock) _clients.Remove(client);
-        }
-
-        /// <summary>
-        /// Handle for one listener. Drain() blocks until there is audio, so the
-        /// HTTP thread can just push bytes to the socket.
-        /// </summary>
-        public sealed class AudioClientHandle : IDisposable
-        {
-            private readonly WebRadio _radio;
-            private readonly AudioClient _client;
-            private bool _disposed;
-
-            internal AudioClientHandle(WebRadio radio, AudioClient client)
+            lock (_sessionsLock)
             {
-                _radio = radio;
-                _client = client;
-            }
-
-            /// <summary>
-            /// Copies available samples. Returns the count, 0 if nothing arrived
-            /// in time, or -1 when the client is gone.
-            /// </summary>
-            public int Drain(float[] dst, int count)
-            {
-                if (_client.Closed) return -1;
-
-                for (int attempt = 0; attempt < 400; attempt++)
+                RadioSession existing;
+                if (_sessions.TryGetValue(id, out existing))
                 {
-                    int got = _client.Ring.Read(dst, 0, count);
-                    if (got > 0) return got;
-                    if (_client.Closed) return -1;
-                    Thread.Sleep(5);
+                    existing.Touch();
+                    return existing;
                 }
 
-                return 0;
-            }
+                if (_sessions.Count >= MaxSessions && id != DefaultSessionId)
+                {
+                    // Refuse rather than silently degrade everyone: N receivers
+                    // means N FIR chains, and on an old CPU that ceiling is real.
+                    throw new SessionLimitException(MaxSessions);
+                }
 
-            public void Dispose()
-            {
-                if (_disposed) return;
-                _disposed = true;
-                _radio.Detach(_client);
+                RadioSession session = new RadioSession(_hub, id, _initialFreq, _initialMode, _initialChannel);
+                session.Configure(_initialMode, _initialChannel, null, _initialBlanker);
+                _sessions[id] = session;
+                return session;
             }
         }
 
-        // ------------------------------------------------------------ waterfall
-
-        /// <summary>
-        /// Copies every spectrum column produced since <paramref name="from"/>.
-        /// Returns the new watermark, so a slow browser can catch up in one go
-        /// instead of silently dropping columns.
-        /// </summary>
-        public long ReadColumns(long from, out byte[] data)
+        private RadioSession Lookup(HttpRequest req)
         {
-            lock (_columnsLock)
-            {
-                long total = _columnsTotal;
-                if (from > total) from = total;
-                if (from < total - MaxColumns) from = total - MaxColumns;
+            string id = req.Get("sid");
+            if (string.IsNullOrEmpty(id)) id = DefaultSessionId;
 
-                int count = (int)(total - from);
-                if (count <= 0)
-                {
-                    data = new byte[0];
-                    return total;
-                }
+            // Session ids come from the outside world, so keep them to something
+            // that cannot be used to grow a dictionary without bound.
+            if (id.Length > 40) id = id.Substring(0, 40);
 
-                data = new byte[count * Bins];
-                for (int i = 0; i < count; i++)
-                {
-                    int slot = (int)((from + i) % MaxColumns);
-                    Buffer.BlockCopy(_columns[slot], 0, data, i * Bins, Bins);
-                }
-
-                return total;
-            }
+            return GetOrCreate(id);
         }
 
-        public long ColumnsTotal
+        private void Reap(object state)
         {
-            get { lock (_columnsLock) return _columnsTotal; }
+            List<RadioSession> dead = new List<RadioSession>();
+            DateTime now = DateTime.UtcNow;
+
+            lock (_sessionsLock)
+            {
+                foreach (KeyValuePair<string, RadioSession> kv in _sessions)
+                {
+                    if (kv.Key == DefaultSessionId) continue;
+                    if (now - kv.Value.LastAccess > SessionIdleTimeout) dead.Add(kv.Value);
+                }
+
+                for (int i = 0; i < dead.Count; i++) _sessions.Remove(dead[i].Id);
+            }
+
+            for (int i = 0; i < dead.Count; i++) dead[i].Dispose();
         }
 
-        // ------------------------------------------------------------ dsp loop
-
-        private void Run()
+        /// <summary>Thrown when the receiver limit is reached; the handler turns it into a 503.</summary>
+        public sealed class SessionLimitException : Exception
         {
-            float[] block = new float[32768];
-            float[] audio = new float[32768];
-            float[] play = new float[32768 * 4 + 64];
-
-            Receiver rx = null;
-            InterpolatingResampler resampler = null;
-            int seenGeneration = -1;
-
-            while (_running)
+            public SessionLimitException(int limit)
+                : base("this server is already running " + limit +
+                       " receivers; close another tab or wait for one to time out")
             {
-                if (seenGeneration != Volatile.Read(ref _generation))
-                {
-                    DemodMode mode;
-                    double channel;
-                    float? squelch;
-                    float? blanker;
-                    double freq;
-
-                    lock (_configLock)
-                    {
-                        mode = _mode;
-                        channel = _channelHz;
-                        squelch = _squelchDb;
-                        blanker = _blankerThreshold;
-                        freq = _freq;
-                    }
-
-                    // Rebuild allocates, but it happens on the DSP thread in
-                    // response to a user action, not inside the audio callback.
-                    ReceiverOptions options = new ReceiverOptions();
-                    options.Mode = mode;
-                    options.ChannelHz = channel;
-                    options.SquelchDb = squelch;
-                    options.BlankerThreshold = blanker;
-                    if (mode == DemodMode.Fm)
-                    {
-                        options.DeviationHz = 75000.0;
-                        options.DeemphasisUs = 50.0;
-                    }
-                    if (mode == DemodMode.Cw) options.BfoHz = 700.0;
-
-                    options.Decimation = Math.Max(1, (int)Math.Round((double)_rate / 12000.0));
-
-                    rx = new Receiver(_rate, freq, options);
-                    resampler = (rx.OutputRate == AudioRate)
-                        ? null
-                        : new InterpolatingResampler(rx.OutputRate, AudioRate);
-
-                    seenGeneration = Volatile.Read(ref _generation);
-                }
-
-                int n = _source.Read(block, 0, block.Length);
-                if (n <= 0) { Thread.Sleep(2); continue; }
-
-                rx.SetTune(Frequency);
-
-                PumpSpectrum(block, n);
-
-                int m = rx.Process(block, n, audio);
-                if (m <= 0) continue;
-
-                _levelDb = rx.LevelDb;
-                _squelchOpen = rx.Squelch.Open;
-
-                int produced;
-                if (resampler == null)
-                {
-                    Array.Copy(audio, play, m);
-                    produced = m;
-                }
-                else
-                {
-                    produced = resampler.Process(audio, m, play, play.Length);
-                }
-
-                if (produced > 0) Broadcast(play, produced);
-            }
-
-            lock (_clientsLock)
-            {
-                for (int i = 0; i < _clients.Count; i++) _clients[i].Closed = true;
-                _clients.Clear();
-            }
-        }
-
-        private void Broadcast(float[] data, int count)
-        {
-            lock (_clientsLock)
-            {
-                for (int i = 0; i < _clients.Count; i++)
-                {
-                    AudioClient c = _clients[i];
-                    if (c.Closed) continue;
-
-                    // A stalled client must not grow its buffer forever: drop the
-                    // oldest audio so latency stays bounded and we stay live.
-                    if (c.Ring.Free < count) c.Ring.Clear();
-                    c.Ring.Write(data, 0, count);
-                }
-            }
-        }
-
-        /// <summary>
-        /// Accumulates samples until a full FFT frame is available, then emits a
-        /// column. Live blocks are often shorter than the FFT (a sound card
-        /// delivers a few hundred samples at a time), so taking "the last N
-        /// samples of the block" would either read garbage or never fire at all.
-        /// </summary>
-        private void PumpSpectrum(float[] block, int n)
-        {
-            int offset = 0;
-
-            while (offset < n)
-            {
-                int take = Math.Min(_fftSize - _fftFill, n - offset);
-                Array.Copy(block, offset, _fftBuf, _fftFill, take);
-                _fftFill += take;
-                offset += take;
-
-                if (_fftFill >= _fftSize)
-                {
-                    EmitColumn();
-                    _fftFill = 0;
-                }
-            }
-        }
-
-        private void EmitColumn()
-        {
-            for (int i = 0; i < _fftSize; i++)
-            {
-                _re[i] = _fftBuf[i] * _window[i];
-                _im[i] = 0.0f;
-            }
-
-            Fft.Forward(_re, _im);
-
-            byte[] column = new byte[Bins];
-            int usable = _fftSize / 2;
-            int perBin = Math.Max(1, usable / Bins);
-
-            for (int b = 0; b < Bins; b++)
-            {
-                double peak = 0.0;
-                int from = b * perBin;
-                int to = Math.Min(usable, from + perBin);
-
-                for (int i = from; i < to; i++)
-                {
-                    double mag = _re[i] * (double)_re[i] + _im[i] * (double)_im[i];
-                    if (mag > peak) peak = mag;
-                }
-
-                double amp = Math.Sqrt(peak) * 4.0 / _fftSize;
-                double db = 20.0 * Math.Log10(Math.Max(amp, 1e-12));
-
-                // Fixed scale: -110 dBFS at the bottom, -20 at the top. A real
-                // receiver's numbers stay comparable between sessions this way.
-                int v = (int)((db + 110.0) / 90.0 * 255.0);
-                if (v < 0) v = 0;
-                if (v > 255) v = 255;
-                column[b] = (byte)v;
-            }
-
-            lock (_columnsLock)
-            {
-                _columns[(int)(_columnsTotal % MaxColumns)] = column;
-                _columnsTotal++;
             }
         }
 
@@ -428,47 +165,63 @@ namespace Radiocity.Web
         {
             string path = req.Path;
 
-            if (path == "/" || path == "/index.html") return Page.Index();
-            if (path == "/waterfall") return HandleWaterfall(req);
-            if (path == "/state") return HandleState();
-            if (path == "/tune") return HandleTune(req);
-            if (path == "/audio") return HandleAudio();
+            try
+            {
+                if (path == "/" || path == "/index.html") return Page.Index();
+                if (path == "/waterfall") return HandleWaterfall(req);
+                if (path == "/state") return HandleState(req);
+                if (path == "/tune") return HandleTune(req);
+                if (path == "/audio") return HandleAudio(req);
 
-            return HttpResponse.NotFound(path);
+                return HttpResponse.NotFound(path);
+            }
+            catch (SessionLimitException ex)
+            {
+                return HttpResponse.Text(ex.Message, 503);
+            }
         }
 
         private HttpResponse HandleWaterfall(HttpRequest req)
         {
             long from = (long)req.GetDouble("from", 0.0);
             byte[] data;
-            long next = ReadColumns(from, out data);
+            long next = _hub.ReadColumns(from, out data);
 
             HttpResponse r = new HttpResponse();
             r.ContentType = "application/octet-stream";
             r.Body = data;
             r.Headers["X-Next-From"] = next.ToString(CultureInfo.InvariantCulture);
-            r.Headers["X-Bins"] = Bins.ToString(CultureInfo.InvariantCulture);
-            r.Headers["X-Rate"] = _rate.ToString(CultureInfo.InvariantCulture);
+            r.Headers["X-Bins"] = CaptureHub.Bins.ToString(CultureInfo.InvariantCulture);
+            r.Headers["X-Rate"] = _hub.SampleRate.ToString(CultureInfo.InvariantCulture);
             return r;
         }
 
-        private HttpResponse HandleState()
+        private HttpResponse HandleState(HttpRequest req)
         {
+            RadioSession s = Lookup(req);
+
             StringBuilder sb = new StringBuilder();
             sb.Append('{');
-            sb.Append("\"freq\":").Append(Frequency.ToString("F0", CultureInfo.InvariantCulture)).Append(',');
-            sb.Append("\"mode\":\"").Append(Mode.ToString().ToUpperInvariant()).Append("\",");
-            sb.Append("\"channel\":").Append(ChannelHz.ToString("F0", CultureInfo.InvariantCulture)).Append(',');
-            sb.Append("\"rate\":").Append(_rate).Append(',');
-            sb.Append("\"level\":").Append(LevelDb.ToString("F1", CultureInfo.InvariantCulture)).Append(',');
-            sb.Append("\"open\":").Append(SquelchOpen ? "true" : "false").Append(',');
+            sb.Append("\"sid\":\"").Append(Escape(s.Id)).Append("\",");
+            sb.Append("\"freq\":").Append(s.Frequency.ToString("F0", CultureInfo.InvariantCulture)).Append(',');
+            sb.Append("\"mode\":\"").Append(s.Mode.ToString().ToUpperInvariant()).Append("\",");
+            sb.Append("\"channel\":").Append(s.ChannelHz.ToString("F0", CultureInfo.InvariantCulture)).Append(',');
+            sb.Append("\"rate\":").Append(_hub.SampleRate).Append(',');
+            sb.Append("\"level\":").Append(s.LevelDb.ToString("F1", CultureInfo.InvariantCulture)).Append(',');
+            sb.Append("\"open\":").Append(s.SquelchOpen ? "true" : "false").Append(',');
 
-            float? blanker = CurrentBlanker;
+            float? blanker = s.BlankerThreshold;
             sb.Append("\"blank\":").Append(blanker.HasValue
                 ? blanker.Value.ToString("F0", CultureInfo.InvariantCulture)
                 : "0").Append(',');
 
-            sb.Append("\"columns\":").Append(ColumnsTotal);
+            float? squelch = s.SquelchDb;
+            sb.Append("\"squelch\":").Append(squelch.HasValue
+                ? squelch.Value.ToString("F0", CultureInfo.InvariantCulture)
+                : "0").Append(',');
+
+            sb.Append("\"sessions\":").Append(SessionCount).Append(',');
+            sb.Append("\"columns\":").Append(_hub.ColumnsTotal);
             sb.Append('}');
 
             return HttpResponse.Json(sb.ToString());
@@ -479,13 +232,15 @@ namespace Radiocity.Web
             if (req.Method != "POST" && req.Method != "GET")
                 return HttpResponse.Text("use POST", 405);
 
-            double freq = req.GetDouble("f", Frequency);
+            RadioSession s = Lookup(req);
+
+            double freq = req.GetDouble("f", s.Frequency);
             string modeText = req.Get("mode");
-            double channel = req.GetDouble("bw", ChannelHz);
+            double channel = req.GetDouble("bw", s.ChannelHz);
             string squelchText = req.Get("squelch");
             string blankText = req.Get("blank");
 
-            DemodMode mode = Mode;
+            DemodMode mode = s.Mode;
             if (!string.IsNullOrEmpty(modeText))
             {
                 switch (modeText.ToLowerInvariant())
@@ -498,17 +253,15 @@ namespace Radiocity.Web
                 }
             }
 
-            float? squelch = null;
+            float? squelch = s.SquelchDb;
             if (!string.IsNullOrEmpty(squelchText))
             {
                 float sv;
                 if (float.TryParse(squelchText, NumberStyles.Float, CultureInfo.InvariantCulture, out sv))
-                    squelch = sv;
+                    squelch = (sv > -120.0f) ? (float?)sv : null;
             }
 
-            float? blanker;
-            lock (_configLock) blanker = _blankerThreshold;
-
+            float? blanker = s.BlankerThreshold;
             if (!string.IsNullOrEmpty(blankText))
             {
                 float bv;
@@ -517,54 +270,62 @@ namespace Radiocity.Web
             }
 
             // Clamp inside what the card can actually see.
-            double limit = _rate * 0.5 - 500.0;
+            double limit = _hub.SampleRate * 0.5 - 500.0;
             if (freq < 0.0) freq = 0.0;
             if (freq > limit) freq = limit;
 
-            bool needsRebuild = (mode != Mode) || Math.Abs(channel - ChannelHz) > 1.0;
+            bool needsRebuild = (mode != s.Mode) || Math.Abs(channel - s.ChannelHz) > 1.0 ||
+                                !Nullable.Equals(squelch, s.SquelchDb) ||
+                                !Nullable.Equals(blanker, s.BlankerThreshold);
 
-            Tune(freq);
-            if (needsRebuild) Configure(mode, channel, squelch);
-            else if (!string.IsNullOrEmpty(squelchText)) SetSquelch(squelch);
+            s.Tune(freq);
+            if (needsRebuild) s.Configure(mode, channel, squelch, blanker);
 
-            if (!Nullable.Equals(blanker, CurrentBlanker)) SetBlanker(blanker);
-
-            return HandleState();
+            return HandleState(req);
         }
 
-        /// <summary>Current blanker threshold, null when off.</summary>
-        public float? CurrentBlanker
+        private HttpResponse HandleAudio(HttpRequest req)
         {
-            get { lock (_configLock) return _blankerThreshold; }
-        }
+            RadioSession s = Lookup(req);
 
-        private HttpResponse HandleAudio()
-        {
             HttpResponse r = new HttpResponse();
-            r.ContentType = "audio/L16;rate=" + AudioRate + ";channels=1";
+            r.ContentType = "audio/L16;rate=" + RadioSession.AudioRate + ";channels=1";
 
-            AudioClientHandle handle = Attach();
+            RadioSession.AudioHandle handle = s.AttachAudio();
             float[] buffer = new float[4096];
             byte[] bytes = new byte[4096 * 2];
 
             r.Stream = delegate(Stream stream)
             {
+                int idle = 0;
+
                 try
                 {
-                    while (_running)
+                    while (!_disposed)
                     {
                         int got = handle.Drain(buffer, buffer.Length);
                         if (got < 0) break;
-                        if (got == 0) continue;      // idle is not an error
+
+                        if (got == 0)
+                        {
+                            // Nothing arrived. Drain waits 200 ms before
+                            // returning zero, so fifty of these is ten seconds
+                            // of silence — long enough to mean the client is
+                            // gone, short enough to stop a thread leaking.
+                            if (++idle >= 50) break;
+                            continue;
+                        }
+
+                        idle = 0;
 
                         for (int i = 0; i < got; i++)
                         {
                             float v = buffer[i];
                             if (v > 1.0f) v = 1.0f;
                             if (v < -1.0f) v = -1.0f;
-                            short s = (short)(v * 32767.0f);
-                            bytes[i * 2] = (byte)s;
-                            bytes[i * 2 + 1] = (byte)(s >> 8);
+                            short sample = (short)(v * 32767.0f);
+                            bytes[i * 2] = (byte)sample;
+                            bytes[i * 2 + 1] = (byte)(sample >> 8);
                         }
 
                         stream.Write(bytes, 0, got * 2);
@@ -580,13 +341,26 @@ namespace Radiocity.Web
             return r;
         }
 
+        private static string Escape(string s)
+        {
+            StringBuilder sb = new StringBuilder(s.Length);
+            for (int i = 0; i < s.Length; i++)
+            {
+                char c = s[i];
+                if (c == '"' || c == '\\') sb.Append('\\').Append(c);
+                else if (c < 0x20) sb.Append('?');
+                else sb.Append(c);
+            }
+            return sb.ToString();
+        }
+
         public void Dispose()
         {
             if (_disposed) return;
             _disposed = true;
 
             Stop();
-            _source.Dispose();
+            _hub.Dispose();
         }
     }
 }

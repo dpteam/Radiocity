@@ -8,8 +8,34 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Planned
 - RSDN-20 and SAQ decoders
-- Multiple simultaneous listeners with independent tuning
 - Stereo capture, so a downconverter's I/Q can be recorded directly
+- Optional password and rate limiting for the web server
+
+## [0.7.0] - 2026-11-12
+
+### Added
+- **Independent tuning per listener.** One sound card, one capture thread, one
+  `RadioSession` per browser — each with its own frequency, mode, bandwidth,
+  squelch, blanker and AGC. Two people can listen to two different frequencies
+  at the same time, which is what a WebSDR is supposed to do.
+- `CaptureHub` — owns the source and the shared waterfall, fans raw blocks out
+  to every session without blocking.
+- Session ids in the query string, with a `default` session for clients that do
+  not keep one, idle reaping after five minutes, and a hard cap of 8 receivers
+  (`503` past that) because N listeners really do mean N FIR chains.
+- Session count in the UI header and in `/state`.
+
+### Changed
+- The web front end is now three pieces instead of one: `CaptureHub` (source and
+  spectrum), `RadioSession` (one receiver), `WebRadio` (sessions and endpoints).
+- Receivers run from the moment a session exists, not from the moment audio
+  attaches — a level meter that only works after you press "Listen" is useless,
+  since its job is to tell you whether to press it.
+
+### Fixed
+- **An abandoned audio connection held a pool thread forever.** A socket whose
+  peer vanished only reports it on write, and an idle stream never writes, so
+  the handler span forever. Ten seconds of silence now ends it.
 
 ## [0.6.0] - 2026-11-12
 

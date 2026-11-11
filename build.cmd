@@ -60,6 +60,8 @@ rem another machine. The resource name is what Page.cs looks up.
     "%~dp0src\Web\HttpServer.cs" ^
     "%~dp0src\Web\SampleSource.cs" ^
     "%~dp0src\Web\Page.cs" ^
+    "%~dp0src\Web\CaptureHub.cs" ^
+    "%~dp0src\Web\RadioSession.cs" ^
     "%~dp0src\Web\WebRadio.cs" ^
     "%~dp0src\App\WavFile.cs" ^
     "%~dp0src\App\Program.cs" ^

@@ -26,6 +26,7 @@ decim   : 192k -> 12k in 2 stages, 4.6x cheaper than one filter
 squelch : mutes on silence, opens on carrier
 blanker : 8.2x less impulse error, tone kept within 1%
 I/Q     : float32 bit-exact round trip, centre frequency preserved
+web     : independent tuning, two sessions verified at 3 kHz and 18 kHz
 DCF77   : full telegram decoded at -40 and -20 dBFS
 ```
 
@@ -141,7 +142,7 @@ affordable on a 2005 CPU.
 | Resampling | `src/Dsp/Demod.cs` | Catmull-Rom; linear interpolation would droop 3.3 dB at 5 kHz |
 | Clock | `src/Dsp/ClockCalib.cs` | FFT peak + parabolic refinement + Goertzel sweep, under 1 ppm |
 | DCF77 | `src/Dsp/Dcf77.cs` | 100/200 ms dip widths, BCD telegram, three parity bits |
-| Web | `src/Web/` | `TcpListener` + hand-rolled HTTP/1.1, waterfall + chunked audio |
+| Web | `src/Web/` | `TcpListener` + hand-rolled HTTP/1.1; one capture, one receiver per listener |
 
 Full explanation in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -211,7 +212,8 @@ and why.
 build.cmd                    one-command build with the in-box csc.exe
 src/Audio/WinMM.cs           waveIn/waveOut P/Invoke
 src/Dsp/                     the entire signal processing chain
-src/Web/                     HTTP server, WebSDR endpoints, synthetic sourceweb/index.html               the UI, embedded into the exe as a resource
+src/Web/                     capture hub, per-listener sessions, HTTP server
+web/index.html               the UI, embedded into the exe as a resource
 src/App/                     CLI, WAV reader/writer, assembly info
 tools/make-icon.ps1          generates assets/radiocity.ico (reproducible, not hand-drawn)
 docs/ARCHITECTURE.md         how it works and why each stage is built that way
@@ -224,16 +226,49 @@ docs/HARDWARE.md             antennas and downconverters, by budget
 
 Working: capture and playback, AM, FM, USB, LSB, CW, AGC, squelch, impulse
 blanker, spectrum, offline demodulation, clock calibration, DCF77 decoding,
-8/16/24/32-bit capture, multi-stage decimation, I/Q recording, and a **WebSDR
-front end**.
+8/16/24/32-bit capture, multi-stage decimation, I/Q recording, a **WebSDR front
+end**, and **independent tuning for every listener**.
 
 Not yet:
 
 - [ ] RSDN-20 and SAQ decoders.
-- [ ] Multiple simultaneous listeners with independent tuning (one receiver,
-      one tuning today; clients share it).
 - [ ] Stereo capture, so a quadrature downconverter's I/Q can be recorded
       directly instead of being synthesised by the mixer.
+- [ ] Password or rate limiting on the web server. It is a receiver for a
+      trusted network, not a public service.
+
+## Many listeners, one sound card
+
+```
+sound card ──► CaptureHub ──┬──► RadioSession "alpha"  (3000 Hz, AM, 6 kHz)
+   one ADC                  ├──► RadioSession "bravo"  (18 kHz, CW, 500 Hz)
+   one thread               └──► RadioSession "charlie" ...
+                                    each: own NCO, filters, demod, AGC
+```
+
+The card can only be opened once, so exactly one thread reads it and hands each
+raw block to every session. Everything downstream of the mixer is per-session:
+frequency, mode, bandwidth, squelch, blanker, AGC. Two browsers can sit on two
+different frequencies and neither disturbs the other.
+
+The waterfall is shared, because the spectrum of the band is the same for
+everyone; only demodulation is duplicated.
+
+**Cost.** N listeners means N FIR chains. At 192 kHz a 9 kHz AM channel is
+~23 M multiply-adds/s each, so eight listeners is ~184 M/s — fine on anything
+modern, and the reason the server caps sessions at 8 and returns `503` past
+that rather than quietly degrading everyone. The cap is `WebRadio.MaxSessions`.
+
+**Sessions** are identified by an opaque id the page keeps in a variable and
+appends to every request. No cookies: they need parsing, expiry and a
+conversation about consent, and a query parameter does the same job. A request
+without an id uses the `default` session, so `curl http://host/state` still
+works. Idle sessions are reaped after five minutes, except `default`.
+
+```
+curl "http://localhost:8080/state?sid=alpha"
+curl -d "f=18000&mode=cw&bw=500" "http://localhost:8080/tune?sid=alpha"
+```
 
 ## Recording the air
 
