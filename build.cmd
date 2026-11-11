@@ -49,6 +49,7 @@ rem another machine. The resource name is what Page.cs looks up.
     "%~dp0src\Dsp\Demod.cs" ^
     "%~dp0src\Dsp\FmDemod.cs" ^
     "%~dp0src\Dsp\FmStereo.cs" ^
+    "%~dp0src\Dsp\Rds.cs" ^
     "%~dp0src\Dsp\SsbDemod.cs" ^
     "%~dp0src\Dsp\ClockCalib.cs" ^
     "%~dp0src\Dsp\DecimationChain.cs" ^
@@ -65,6 +66,7 @@ rem another machine. The resource name is what Page.cs looks up.
     "%~dp0src\Web\CaptureHub.cs" ^
     "%~dp0src\Web\RadioSession.cs" ^
     "%~dp0src\Web\QuadratureSource.cs" ^
+    "%~dp0src\Web\SyntheticFmSource.cs" ^
     "%~dp0src\Web\WebRadio.cs" ^
     "%~dp0src\App\WavFile.cs" ^
     "%~dp0src\App\Program.cs" ^

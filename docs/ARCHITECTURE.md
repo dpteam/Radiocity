@@ -336,6 +336,57 @@ and R, not the composite. Applying it early would distort the sideband.
 A mono AGC over interleaved samples would move the stereo image every time one
 side got louder.
 
+## RDS — `src/Dsp/Rds.cs`
+
+RDS is a 1187.5 bps data stream on a suppressed 57 kHz subcarrier. Two details
+make it tractable:
+
+**57 kHz is 3 × 19 kHz.** The data subcarrier is the third harmonic of the stereo
+pilot, which is deliberate — a receiver already locks the pilot for stereo, so
+the same reference serves RDS. The correction is the pilot phasor raised to the
+third power (`e^{j(3θ+3ψ)} = e^{j3θ}·(p/|p|)^3`). Stereo needs the square, RDS
+needs the cube; getting the power wrong shifts the phase by one or two times the
+pilot error.
+
+**1187.5 bps is 57000/48.** Exactly 48 cycles of the subcarrier per bit, so the
+scheme is phase-coherent end to end.
+
+The receive chain:
+
+```
+composite -> mix 57 kHz (pilot-locked) -> LP 2.4 kHz -> decimate to 9.6 kHz
+          -> biphase correlate -> differential decode -> 26-bit blocks
+          -> CRC/offset-word sync -> group parse
+```
+
+**Biphase.** Each bit is `+1,-1` for a 1 and `-1,+1` for a 0, so the transition
+carries the data. Correlating against a `+1,-1` reference over one bit period
+turns that into a sign.
+
+**Bit clock.** Early-late: correlate at ±0.15 of a bit and move the phase toward
+whichever correlates more strongly. The phase term is essential — the decimation
+filters delay the signal by more than a whole bit, so a loop that only trims the
+frequency would never converge. (It did not, the first time.)
+
+**Block sync is free.** A block is 16 data bits + 10 CRC bits, and the CRC is
+XORed with an offset word identifying the block's position (A/B/C/D). Sync means
+finding a 26-bit window whose syndrome equals offset A; no preamble needed.
+
+**Error correction** tries every one- and two-bit flip pattern. The standard's
+five-bit corrector uses a syndrome table that costs more memory than this entire
+decoder, and two bits covers most real damage.
+
+**Differential decoding** makes a 180° demodulator phase error harmless: the data
+is the XOR of consecutive received bits, so inverting everything changes nothing.
+
+Groups are then parsed: type 0 carries the 8-character station name two
+characters at a time across four segments, type 2 carries RadioText four
+characters at a time across sixteen.
+
+Clock time (group 4A) is not implemented. Its field layout is easy to get
+subtly wrong and impossible to verify without a real transmitter, and a wrong
+clock is worse than no clock.
+
 ## Performance notes
 
 Everything in `Process()` is preallocated. The whole AM chain at 48 kHz runs in

@@ -244,6 +244,18 @@ namespace Radiocity.Web
 
             sb.Append("\"sessions\":").Append(SessionCount).Append(',');
             sb.Append("\"stereo\":").Append(s.Channels == 2 ? "true" : "false").Append(',');
+
+            // RDS only exists when a stereo FM receiver is running, so the fields
+            // are emitted empty rather than absent: a client should not have to
+            // special-case a missing key.
+            RdsDecoder rds = s.Rds;
+            sb.Append("\"rds\":").Append(rds != null && rds.Synced ? "true" : "false").Append(',');
+            sb.Append("\"pi\":\"").Append(rds != null && rds.PiCode != 0
+                ? rds.PiCode.ToString("X4", CultureInfo.InvariantCulture) : "").Append("\",");
+            sb.Append("\"ps\":\"").Append(Escape(rds != null ? (rds.ProgramService ?? "") : "")).Append("\",");
+            sb.Append("\"rt\":\"").Append(Escape(rds != null ? rds.RadioText : "")).Append("\",");
+            sb.Append("\"pty\":").Append(rds != null ? rds.Pty : 0).Append(',');
+            sb.Append("\"groups\":").Append(rds != null ? rds.Groups : 0).Append(',');
             sb.Append("\"quadrature\":").Append(_hub.IsQuadrature ? "true" : "false").Append(',');
             sb.Append("\"bandLo\":").Append(_hub.BandLo.ToString("F0", CultureInfo.InvariantCulture)).Append(',');
             sb.Append("\"bandHi\":").Append(_hub.BandHi.ToString("F0", CultureInfo.InvariantCulture)).Append(',');

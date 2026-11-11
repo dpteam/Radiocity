@@ -62,6 +62,13 @@ namespace Radiocity.Dsp
         /// </summary>
         public bool FmStereo;
 
+        /// <summary>
+        /// Decode RDS from the 57 kHz subcarrier. Only meaningful together with
+        /// FmStereo, because it needs the pilot as a phase reference and a
+        /// baseband wide enough to hold 57 kHz.
+        /// </summary>
+        public bool Rds;
+
         public ReceiverOptions()
         {
             Mode = DemodMode.Am;
@@ -76,6 +83,7 @@ namespace Radiocity.Dsp
             BlankerThreshold = null;
             CorrectImbalance = false;
             FmStereo = false;
+            Rds = false;
         }
 
         public static ReceiverOptions Am(int decimation)
@@ -103,6 +111,7 @@ namespace Radiocity.Dsp
         {
             ReceiverOptions o = Fm(decimation);
             o.FmStereo = true;
+            o.Rds = true;
             return o;
         }
 
@@ -148,6 +157,7 @@ namespace Radiocity.Dsp
         private readonly NoiseBlanker _blanker;
         private readonly IqImbalance _imbalance;
         private readonly FmStereoDecoder _stereo;
+        private readonly RdsDecoder _rds;
         private readonly LinkedAgc _stereoAgc;
         private readonly DemodMode _mode;
         private readonly bool _agcEnabled;
@@ -230,6 +240,12 @@ namespace Radiocity.Dsp
                     if (options.FmStereo)
                     {
                         _stereo = new FmStereoDecoder(OutputRate, 48000, options.DeemphasisUs);
+
+                        // RDS rides on the same composite at 57 kHz, so it has to
+                        // be decoded at the baseband rate, before OutputRate is
+                        // reassigned to the audio rate.
+                        if (options.Rds && OutputRate >= 32000) _rds = new RdsDecoder(OutputRate);
+
                         OutputRate = _stereo.AudioRate;
                         Channels = 2;
 
@@ -344,6 +360,9 @@ namespace Radiocity.Dsp
         /// <summary>Pilot amplitude, for a stereo indicator.</summary>
         public float StereoPilot { get { return _stereo != null ? _stereo.PilotLevel : 0.0f; } }
 
+        /// <summary>RDS decoder, or null when RDS is not enabled.</summary>
+        public RdsDecoder Rds { get { return _rds; } }
+
         /// <summary>Safe to call from any thread; takes effect at the next block.</summary>
         public void SetTune(double hz)
         {
@@ -436,6 +455,10 @@ namespace Radiocity.Dsp
                 case DemodMode.Fm: _fm.Process(_bi, _bq, m, _audio); break;
                 default: _ssb.Process(_bi, _bq, m, _audio); break;
             }
+
+            // RDS reads the composite, so it has to run before the stereo decoder
+            // turns that composite into audio.
+            if (_rds != null) _rds.Process(_audio, m);
 
             if (_stereo != null)
             {

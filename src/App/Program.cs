@@ -153,6 +153,8 @@ namespace Radiocity.App
             Console.WriteLine();
             ok &= RunFmStereoTest();
             Console.WriteLine();
+            ok &= RunRdsTest();
+            Console.WriteLine();
             ok &= RunSsbTest();
             Console.WriteLine();
             ok &= RunCwTest();
@@ -775,6 +777,107 @@ namespace Radiocity.App
             return Math.Sqrt(re * re + im * im) * 2.0 / count;
         }
 
+        private static bool RunRdsTest()
+        {
+            // RDS is a digital protocol, so this test can be exact: build a known
+            // group sequence, modulate it, and require the exact strings back.
+            const double fs = 192000.0;
+            const double amplitude = 0.03;
+
+            // First the code itself, with no radio in the way. If this fails the
+            // problem is the CRC or the framing, and debugging DSP at the same
+            // time would be a waste of an evening.
+            int block = RdsEncoder.Block(0x1234, RdsCode.OffsetA);
+            int syndrome = RdsCode.Syndrome(block);
+            int corrected;
+            int errors;
+            int damaged = block ^ (1 << 7) ^ (1 << 19);
+            bool repaired = RdsCode.TryCorrect(damaged, RdsCode.OffsetA, out corrected, out errors);
+
+            Console.WriteLine("RDS self-test");
+            Console.WriteLine("  block code: syndrome " + syndrome.ToString("X3", Inv) +
+                              " (expected " + RdsCode.OffsetA.ToString("X3", Inv) + ")");
+            Console.WriteLine("  2-bit damage repaired: " + (repaired && corrected == block) +
+                              ", errors found " + errors);
+
+            bool codeOk = syndrome == RdsCode.OffsetA && repaired && corrected == block;
+
+            // Now the whole chain: pilot + RDS on a composite, decoded from scratch.
+            int groups = 24;
+            int[] bits = new int[groups * 104];
+            int at = 0;
+
+            for (int g = 0; g < groups; g++)
+            {
+                int[] words = BuildRdsGroup(g);
+                int[] encoded = RdsEncoder.EncodeBits(words);
+                Array.Copy(encoded, 0, bits, at, encoded.Length);
+                at += encoded.Length;
+            }
+
+            int n = (int)Math.Round(bits.Length * (fs / RdsCode.BitRateHz)) + 4096;
+            float[] composite = new float[n];
+
+            // The pilot, without which the decoder has no phase reference.
+            for (int k = 0; k < n; k++)
+                composite[k] = (float)(0.1 * Math.Cos(2.0 * Math.PI * RdsCode.PilotHz * k / fs));
+
+            RdsEncoder.Render(composite, fs, bits, amplitude);
+
+            RdsDecoder dec = new RdsDecoder(fs);
+            dec.Process(composite, n);
+
+            Console.WriteLine("  decoded " + dec.Groups + " groups, " + dec.BadBlocks + " bad blocks, " +
+                              dec.CorrectedBits + " corrected bits");
+            Console.WriteLine("  PI " + dec.PiCode.ToString("X4", Inv) + ", PS \"" + (dec.ProgramService ?? "") +
+                              "\", RT \"" + dec.RadioText + "\"");
+
+            bool ok = codeOk &&
+                      dec.PiCode == 0x1234 &&
+                      dec.ProgramService == "TEST FM " &&
+                      dec.RadioText.StartsWith("HELLO RADIO", StringComparison.Ordinal);
+
+            Console.WriteLine(ok ? "  PASS" : "  FAIL: RDS did not decode");
+            return ok;
+        }
+
+        /// <summary>
+        /// One group of the test sequence: four groups of type 0 carry the eight
+        /// characters of the station name, the rest carry RadioText.
+        /// </summary>
+        private static int[] BuildRdsGroup(int index)
+        {
+            const int pi = 0x1234;
+            string ps = "TEST FM ";
+            string rt = "HELLO RADIO WORLD FROM RADIOCITY";
+
+            if (index < 4)
+            {
+                // Type 0A: block D holds two characters, segment 0-3.
+                int seg = index;
+                int b = (0 << 12) | (0 << 11) | (1 << 10) | (0 << 5) | seg;
+                int c = 0xE0E0;                       // no alternative frequencies
+                int d = (ps[seg * 2] << 8) | ps[seg * 2 + 1];
+
+                return new int[] { pi, b, c, d };
+            }
+
+            // Type 2A: four characters per group, segments 0-15.
+            int rtSeg = (index - 4) % 16;
+            int offset = rtSeg * 4;
+
+            int ch0 = offset < rt.Length ? rt[offset] : ' ';
+            int ch1 = offset + 1 < rt.Length ? rt[offset + 1] : ' ';
+            int ch2 = offset + 2 < rt.Length ? rt[offset + 2] : ' ';
+            int ch3 = offset + 3 < rt.Length ? rt[offset + 3] : ' ';
+
+            int bb = (2 << 12) | (0 << 11) | (1 << 10) | (0 << 5) | (0 << 4) | rtSeg;
+            int cc = (ch0 << 8) | ch1;
+            int dd = (ch2 << 8) | ch3;
+
+            return new int[] { pi, bb, cc, dd };
+        }
+
         private static bool RunImbalanceTest()
         {
             // A real quadrature front end has two analogue paths that are never
@@ -1372,6 +1475,7 @@ namespace Radiocity.App
             bool simulated = false;
             bool quadrature = false;
             bool simulatedQuadrature = false;
+            bool simulatedFm = false;
             bool correctImbalance = true;
             int port = 8080;
             int rate = 48000;
@@ -1386,6 +1490,7 @@ namespace Radiocity.App
                 if (a == "--sim") simulated = true;
                 else if (a == "--iq") quadrature = true;
                 else if (a == "--sim-iq") simulatedQuadrature = true;
+                else if (a == "--sim-fm") simulatedFm = true;
                 else if (a == "--no-imbalance") correctImbalance = false;
                 else if (a == "--port" && i + 1 < args.Length) port = int.Parse(args[++i], Inv);
                 else if (a == "--rate" && i + 1 < args.Length) rate = int.Parse(args[++i], Inv);
@@ -1397,7 +1502,17 @@ namespace Radiocity.App
 
             ISampleSource source;
 
-            if (simulatedQuadrature)
+            if (simulatedFm)
+            {
+                // A whole FM stereo station with RDS, so the web UI can be shown
+                // end to end on a machine with no sound card and no antenna.
+                source = new SyntheticFmSource(rate, 75000.0);
+                StereoRequested = true;
+                mode = DemodMode.Fm;
+                freq = 0.0;
+                Console.WriteLine("source: " + source.Description + " (no hardware needed)");
+            }
+            else if (simulatedQuadrature)
             {
                 // 2% gain error and 3 degrees of phase error: a plausible
                 // SoftRock, and enough that the image is audible without
@@ -1455,8 +1570,7 @@ namespace Radiocity.App
                                   (rate / 2).ToString("F0", Inv) + " .. " + (rate / 2).ToString("F0", Inv) + " Hz" +
                                   (radio.IsQuadrature ? " around the LO" : ""));
                 if (radio.IsQuadrature && correctImbalance) Console.WriteLine("  I/Q imbalance correction: on");
-                Console.WriteLine("  press Ctrl+C to stop");
-                Console.WriteLine();
+                Console.WriteLine("  press Ctrl+C to stop");                Console.WriteLine();
 
                 ManualResetEvent stop = new ManualResetEvent(false);
                 Console.CancelKeyPress += delegate(object sender, ConsoleCancelEventArgs e)

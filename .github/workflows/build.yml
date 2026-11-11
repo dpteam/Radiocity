@@ -306,6 +306,66 @@ jobs:
             stereo-test.err
           if-no-files-found: ignore
 
+      # RDS is digital, so the check is exact: the station name and text must come
+      # back character for character. The synthetic source broadcasts a known
+      # identity, which makes this a real assertion rather than "it ran".
+      - name: RDS integration test
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Get-Process Radiocity -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+
+          $proc = Start-Process -FilePath "bin\Radiocity.exe" -ArgumentList "web","--sim-fm","--port","8096","--rate","192000" -PassThru -WindowStyle Hidden -RedirectStandardOutput "rds-test.log" -RedirectStandardError "rds-test.err"
+
+          try {
+            $ok = $false
+            for ($i = 0; $i -lt 60; $i++) {
+              Start-Sleep -Milliseconds 250
+              try {
+                $probe = New-Object System.Net.Sockets.TcpClient
+                $probe.Connect("127.0.0.1", 8096)
+                $probe.Close()
+                $ok = $true
+                break
+              } catch { }
+            }
+            if (-not $ok) { throw "RDS server did not open port 8096" }
+
+            # A full RDS cycle is 20 groups at 11.4 groups/s, so allow ~4 s.
+            $state = $null
+            for ($i = 0; $i -lt 40; $i++) {
+              Start-Sleep -Milliseconds 500
+              try { $state = Invoke-RestMethod "http://localhost:8096/state" -TimeoutSec 10 } catch { continue }
+              if ($state.rds -eq $true -and $state.ps -eq "RADIOCIT") { break }
+            }
+            if ($null -eq $state) { throw "GET /state never answered" }
+
+            if ($state.mode -ne "FM") { throw "mode is $($state.mode), expected FM" }
+
+            Write-Host "RDS: pi=$($state.pi) ps=$($state.ps) groups=$($state.groups)"
+            Write-Host "RT: $($state.rt)"
+
+            if ($state.rds -ne $true) { throw "RDS never synchronised" }
+            if ($state.pi -ne "CAFE") { throw "PI is $($state.pi), expected CAFE" }
+            if ($state.ps -ne "RADIOCIT") { throw "PS is '$($state.ps)', expected 'RADIOCIT'" }
+            if ($state.rt -notlike "*SYNTHETIC FM DEMO*") { throw "RadioText is '$($state.rt)'" }
+            if ($state.stereo -ne $true) { throw "station should decode as stereo" }
+          }
+          finally {
+            if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
+          }
+
+      - name: Upload RDS test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rds-test-log
+          path: |
+            rds-test.log
+            rds-test.err
+          if-no-files-found: ignore
+
       # The icon is generated, not hand-edited. Rather than compare bytes —
       # GDI+ antialiasing differs between Windows versions, so a hash check
       # would fail for reasons outside anyone's control — parse the file and

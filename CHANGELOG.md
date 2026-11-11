@@ -8,8 +8,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Planned
 - RSDN-20 and SAQ decoders
-- RDS: station name, radiotext and clock from the 57 kHz subcarrier
+- RDS clock time (group 4A), verified against a real transmitter
 - Optional password and rate limiting for the web server
+
+## [0.10.0] - 2026-11-12
+
+### Added
+- **RDS decoding** — 57 kHz subcarrier, biphase symbols, differential decoding,
+  block sync from CRC offset words, two-bit error correction, and group parsing
+  for PI, PS, RadioText, PTY and TP.
+- `SyntheticFmSource` and `web --sim-fm`: a complete synthetic FM stereo station
+  with RDS, so the whole FM path can be demonstrated on a machine with no sound
+  card and no antenna.
+- RDS panel in the web UI and `pi`/`ps`/`rt`/`pty`/`groups`/`rds` in `/state`.
+- RDS integration test in CI: it asserts the exact station name and text, because
+  RDS is digital and "roughly right" means broken.
+
+### Changed
+- `RdsDecoder.Process` chunks internally, so callers can pass whatever block size
+  their capture produced.
+
+### Notes
+- Clock time (group 4A) is deliberately not implemented. The field layout is
+  documented but unverified against a real transmitter, and shipping a plausible
+  guess for a *clock* is worse than shipping nothing.
 
 ## [0.9.0] - 2026-11-12
 

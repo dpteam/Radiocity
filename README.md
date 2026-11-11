@@ -20,6 +20,7 @@ audio hardware that is already in the machine.
 AM      : distortion 109.5 dB below tone      (below float32 resolution)
 FM      : residual    62.3 dB below tone
 FM st.  : 48 dB channel separation (1 kHz left, 3 kHz right)
+RDS     : 24 groups, 0 bad blocks, station name and text exact
 SSB     : sideband rejection -111.1 dB
 CW      : carrier -> 700 Hz beat note
 clock   : 27.0 ppm injected, 26.92 ppm measured
@@ -151,6 +152,7 @@ affordable on a 2005 CPU.
 | FM | `src/Dsp/FmDemod.cs` | `atan2` of `z[n]·conj(z[n-1])` — amplitude-independent, so no limiter |
 | SSB/CW | `src/Dsp/SsbDemod.cs` | Phasing method, 127-tap Hilbert, −111 dB rejection |
 | FM stereo | `src/Dsp/FmStereo.cs` | 19 kHz pilot, 38 kHz subcarrier recovered by squaring the pilot phasor, stereo matrix |
+| RDS | `src/Dsp/Rds.cs` | 57 kHz subcarrier, biphase + differential decode, CRC with offset words, station name and text |
 | AGC | `src/Dsp/Demod.cs` | RMS detector, asymmetric *gain slew* (not an asymmetric detector) |
 | Squelch | `src/Dsp/Squelch.cs` | Hysteresis on channel power, measured before the AGC |
 | Blanker | `src/Dsp/NoiseBlanker.cs` | Impulse detection on the baseband, before the channel filter smears the click |
@@ -180,6 +182,7 @@ Full explanation in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | I/Q file | float32 bit-exact, int16 within half an LSB | metadata survives the round trip |
 | Imbalance | image from −31 dB to −80 dB | blind correction must not need a calibration signal |
 | FM stereo | > 30 dB channel separation | below that the stereo image collapses to mono |
+| RDS | exact station name and text | it is digital; "roughly right" means broken |
 | Resampler | amplitude within 2%, > 30 dB | a bad interpolator is audible as dullness |
 | DCF77 | full frame at −40 and −20 dBFS | the second one is a noisy city, not a lab |
 
@@ -247,12 +250,13 @@ Working: capture and playback, AM, FM, USB, LSB, CW, AGC, squelch, impulse
 blanker, spectrum, offline demodulation, clock calibration, DCF77 decoding,
 8/16/24/32-bit capture, multi-stage decimation, I/Q recording, a **WebSDR front
 end**, **independent tuning for every listener**, a **quadrature front end path**
-with blind I/Q imbalance correction, and **FM stereo**.
+with blind I/Q imbalance correction, **FM stereo**, and **RDS**.
 
 Not yet:
 
 - [ ] RSDN-20 and SAQ decoders.
-- [ ] RDS (the 57 kHz data subcarrier) — station name, radiotext, clock time.
+- [ ] RDS clock time (group 4A). The layout is documented but not verified
+      against a real transmitter, so it is left out rather than shipped wrong.
 - [ ] Password and rate limiting on the web server. It is a receiver for a
       trusted network, not a public service.
 
@@ -360,6 +364,45 @@ works. Idle sessions are reaped after five minutes, except `default`.
 curl "http://localhost:8080/state?sid=alpha"
 curl -d "f=18000&mode=cw&bw=500" "http://localhost:8080/tune?sid=alpha"
 ```
+
+## RDS
+
+```cmd
+bin\Radiocity.exe web --sim-fm          rem synthetic station, no hardware
+bin\Radiocity.exe web --iq --rate 192000 -stereo
+```
+
+RDS rides on a 57 kHz subcarrier - the third harmonic of the 19 kHz stereo pilot,
+which is not a coincidence: it lets a receiver lock the data to a reference it
+already has. Same trick as stereo, one power higher: the pilot phasor is cubed,
+not squared.
+
+What comes out:
+
+```
+pi=CAFE ps=RADIOCIT pty=10
+RT: RADIOCITY SOUND CARD SDR - SYNTHETIC FM DEMO
+```
+
+Decoded: PI (station identifier), PS (8-character station name), RadioText (up to
+64 characters), PTY (programme type), and group statistics.
+
+**Why there is no preamble.** Every 26-bit block is 16 data bits plus a 10-bit
+CRC, and the CRC is XORed with an *offset word* that identifies the block position
+in the group (A, B, C or D). Block sync is therefore free: look for a window
+whose syndrome equals offset A.
+
+**Error correction** repairs up to two flipped bits by trying every one- and
+two-bit pattern. The full standard corrects five using a syndrome table; that
+table costs more memory than the rest of the decoder and two bits covers most
+real damage, so three or more drops the block and the group parser waits.
+
+**Differential decoding** means a 180 degree phase error in the demodulator is
+harmless: what arrives is the XOR of consecutive bits, so inverting everything
+changes nothing.
+
+The web UI shows the station name and text in a panel under the waterfall, and
+`/state` exposes `pi`, `ps`, `rt`, `pty`, `groups` and `rds`.
 
 ## Recording the air
 

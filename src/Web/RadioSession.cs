@@ -87,6 +87,10 @@ namespace Radiocity.Web
         public int Channels { get { return _channels; } }
         private volatile int _channels = 1;
 
+        /// <summary>RDS state, or null when the current receiver has no RDS decoder.</summary>
+        public RdsDecoder Rds { get { return _rds; } }
+        private volatile RdsDecoder _rds;
+
         /// <summary>Filter cost of this session's chain, once it has been built.</summary>
         public double FilterCost { get { return _filterCost; } }
         private double _filterCost;
@@ -278,6 +282,7 @@ namespace Radiocity.Web
                         options.DeviationHz = 75000.0;
                         options.DeemphasisUs = 50.0;
                         options.FmStereo = _stereo;
+                        options.Rds = _stereo;
                     }
                     if (mode == DemodMode.Cw) options.BfoHz = 700.0;
 
@@ -285,6 +290,7 @@ namespace Radiocity.Web
 
                     rx = new Receiver(_rate, freq, options);
                     _channels = rx.Channels;
+                    _rds = rx.Rds;
 
                     resampler = (rx.OutputRate == AudioRate)
                         ? null
