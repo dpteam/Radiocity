@@ -45,6 +45,98 @@ jobs:
           bin\Radiocity.exe help
           if errorlevel 1 exit /b 1
 
+      # The UI is plain JS in a single <script> block. Parsing it costs nothing
+      # and catches the class of typo that would otherwise only show up as a
+      # blank page in someone's browser.
+      - name: Validate the UI script
+        shell: powershell
+        run: |
+          $html = Get-Content web\index.html -Raw
+          $m = [regex]::Match($html, '(?s)<script>(.*?)</script>')
+          if (-not $m.Success) { throw "no <script> block found in web/index.html" }
+          $m.Groups[1].Value | Out-File -Encoding utf8 ui.js
+          node --check ui.js
+          if ($LASTEXITCODE -ne 0) { throw "UI script has a syntax error" }
+          Write-Host "UI script parses"
+
+      # Real integration test: start the server on the synthetic source and talk
+      # to it over HTTP the way a browser would.
+      - name: WebSDR integration test
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Get-Process Radiocity -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+
+          $proc = Start-Process -FilePath "bin\Radiocity.exe" -ArgumentList "web","--sim","--port","8099","--rate","48000" -PassThru -WindowStyle Hidden -RedirectStandardOutput "web-test.log" -RedirectStandardError "web-test.err"
+
+          try {
+            $ok = $false
+            for ($i = 0; $i -lt 40; $i++) {
+              Start-Sleep -Milliseconds 250
+              try {
+                Invoke-WebRequest "http://localhost:8099/state" -UseBasicParsing -TimeoutSec 2 | Out-Null
+                $ok = $true
+                break
+              } catch {
+                if ($i -eq 39) { Write-Host "last attempt failed: $($_.Exception.Message)" }
+              }
+            }
+            if (-not $ok) { throw "server did not come up" }
+
+            $state = Invoke-RestMethod "http://localhost:8099/state"
+            if ($state.rate -ne 48000) { throw "unexpected rate: $($state.rate)" }
+            Write-Host "state: $($state | ConvertTo-Json -Compress)"
+
+            $ui = Invoke-WebRequest "http://localhost:8099/" -UseBasicParsing
+            if ($ui.Content -notmatch '<title>Radiocity</title>') { throw "UI did not serve the embedded page" }
+            Write-Host "UI: $($ui.RawContentLength) bytes"
+
+            $wf = Invoke-WebRequest "http://localhost:8099/waterfall?from=0" -UseBasicParsing
+            if ($wf.RawContentLength -lt 256) { throw "waterfall returned no columns" }
+            Write-Host "waterfall: $($wf.RawContentLength) bytes, next=$($wf.Headers['X-Next-From'])"
+
+            $tuned = Invoke-RestMethod "http://localhost:8099/tune" -Method POST -Body "f=3000&mode=cw&bw=500"
+            if ($tuned.freq -ne 3000) { throw "tune did not take effect" }
+            if ($tuned.mode -ne "CW") { throw "mode switch did not take effect" }
+            Write-Host "tuned: $($tuned | ConvertTo-Json -Compress)"
+
+            # Audio must actually stream PCM, not just answer 200. Read against a
+            # time budget rather than an iteration count: chunked responses
+            # arrive in whatever sizes the server flushed.
+            $client = New-Object System.Net.Sockets.TcpClient
+            $client.Connect("127.0.0.1", 8099)
+            $stream = $client.GetStream()
+            $stream.ReadTimeout = 8000
+            $req = [Text.Encoding]::ASCII.GetBytes("GET /audio HTTP/1.1`r`nHost: localhost`r`n`r`n")
+            $stream.Write($req, 0, $req.Length)
+
+            $buffer = New-Object byte[] 8192
+            $total = 0
+            $deadline = (Get-Date).AddSeconds(5)
+            while ((Get-Date) -lt $deadline -and $total -lt 16384) {
+              $n = $stream.Read($buffer, 0, 8192)
+              if ($n -le 0) { break }
+              $total += $n
+            }
+            $client.Close()
+            if ($total -lt 4096) { throw "audio stream delivered only $total bytes" }
+            Write-Host "audio: $total bytes"
+          }
+          finally {
+            if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
+          }
+
+      - name: Upload web test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-test-log
+          path: |
+            web-test.log
+            web-test.err
+          if-no-files-found: ignore
+
       # The icon is generated, not hand-edited. Rather than compare bytes —
       # GDI+ antialiasing differs between Windows versions, so a hash check
       # would fail for reasons outside anyone's control — parse the file and
