@@ -55,6 +55,13 @@ namespace Radiocity.Dsp
         /// </summary>
         public bool CorrectImbalance;
 
+        /// <summary>
+        /// Decode FM stereo (pilot + 38 kHz subcarrier) instead of mono. Needs a
+        /// wide baseband: the composite carries information up to 53 kHz, so the
+        /// card must be sampling at 128 kHz or more.
+        /// </summary>
+        public bool FmStereo;
+
         public ReceiverOptions()
         {
             Mode = DemodMode.Am;
@@ -68,6 +75,7 @@ namespace Radiocity.Dsp
             SquelchDb = null;
             BlankerThreshold = null;
             CorrectImbalance = false;
+            FmStereo = false;
         }
 
         public static ReceiverOptions Am(int decimation)
@@ -87,6 +95,14 @@ namespace Radiocity.Dsp
             o.ChannelHz = 180000.0;
             o.DeviationHz = 75000.0;
             o.DeemphasisUs = 50.0;
+            return o;
+        }
+
+        /// <summary>FM stereo. Requires the card to deliver at least 128 kHz.</summary>
+        public static ReceiverOptions FmStereoMode(int decimation)
+        {
+            ReceiverOptions o = Fm(decimation);
+            o.FmStereo = true;
             return o;
         }
 
@@ -131,6 +147,8 @@ namespace Radiocity.Dsp
         private readonly Squelch _squelch;
         private readonly NoiseBlanker _blanker;
         private readonly IqImbalance _imbalance;
+        private readonly FmStereoDecoder _stereo;
+        private readonly LinkedAgc _stereoAgc;
         private readonly DemodMode _mode;
         private readonly bool _agcEnabled;
 
@@ -139,6 +157,9 @@ namespace Radiocity.Dsp
         private readonly float[] _bi;
         private readonly float[] _bq;
         private readonly float[] _audio;
+        private readonly float[] _stereoOut;
+        private readonly RealDecimator _audioDecim;
+        private readonly float[] _audioDecimOut;
 
         /// <summary>
         /// Pending tune in whole Hz, 0 meaning none. An int so the write is atomic
@@ -155,13 +176,42 @@ namespace Radiocity.Dsp
 
             _mode = options.Mode;
             SampleRate = sampleRate;
-            OutputRate = (int)(sampleRate / options.Decimation);
+
+            // FM needs a much wider baseband than AM or SSB. A stereo broadcast
+            // puts information up to 53 kHz into the composite, so the chain must
+            // not decimate below ~106 kHz; even mono FM carries audio to 15 kHz,
+            // which 12 kHz of baseband would truncate at 6 kHz.
+            int decim = options.Decimation;
+            if (_mode == DemodMode.Fm)
+            {
+                // The baseband must cover the *channel*, not the audio. Broadcast
+                // FM deviates by +-75 kHz, so anything narrower than ~150 kHz
+                // clips the deviation and destroys the signal before the
+                // discriminator ever sees it. Audio is decimated after
+                // demodulation, which is a separate step.
+                double target = Math.Max(options.FmStereo ? 128000.0 : 48000.0, options.ChannelHz * 1.1);
+                decim = Math.Max(1, (int)(sampleRate / target));
+            }
+
+            int basebandRate;
+
+            int baseband = (int)(sampleRate / decim);
+            if (_mode == DemodMode.Fm && options.FmStereo && baseband < 106000)
+            {
+                throw new NotSupportedException(
+                    "FM stereo needs at least 128 kHz of capture; this is " +
+                    (sampleRate / 1000.0).ToString("F0", System.Globalization.CultureInfo.InvariantCulture) +
+                    " kHz. Use --rate 192000, or listen in mono.");
+            }
+
+            OutputRate = baseband;
 
             _nco = new Nco();
             _nco.SetFrequency(tuneHz, sampleRate);
 
             _chain = new DecimationChain(sampleRate, OutputRate, options.ChannelHz, 32768);
             OutputRate = _chain.OutputRate;
+            basebandRate = OutputRate;
 
             switch (_mode)
             {
@@ -169,7 +219,43 @@ namespace Radiocity.Dsp
                     _am = new AmDemod(OutputRate, 20.0);
                     break;
                 case DemodMode.Fm:
-                    _fm = new FmDemod(OutputRate, options.DeviationHz, options.DeemphasisUs);
+                    // The discriminator always runs: it produces the composite,
+                    // which is the input to both the mono path and the stereo
+                    // decoder. De-emphasis is deliberately zero here for stereo,
+                    // because the transmitter pre-emphasised L and R, not the
+                    // composite — applying it early would distort the sideband.
+                    _fm = new FmDemod(OutputRate, options.DeviationHz,
+                                      options.FmStereo ? 0.0 : options.DeemphasisUs);
+
+                    if (options.FmStereo)
+                    {
+                        _stereo = new FmStereoDecoder(OutputRate, 48000, options.DeemphasisUs);
+                        OutputRate = _stereo.AudioRate;
+                        Channels = 2;
+
+                        // Linked, because a mono AGC on interleaved L/R would move
+                        // the stereo image every time one channel got louder.
+                        _stereoAgc = new LinkedAgc(OutputRate, 25.0, 400.0, 0.30);
+                    }
+                    else
+                    {
+                        // The discriminator output is a composite at the full
+                        // baseband rate; the audio it carries stops at 15 kHz, so
+                        // drop it to ~48 kHz before anything else touches it.
+                        int audioDecim = Math.Max(1, OutputRate / 48000);
+                        if (audioDecim > 1)
+                        {
+                            double pass = 15000.0 / OutputRate;
+                            double stop = 0.5 / audioDecim;
+                            int taps = (stop - pass < 0.002)
+                                ? 63
+                                : (int)Math.Ceiling(62.0 / (2.285 * 2.0 * Math.PI * (stop - pass)));
+
+                            _audioDecim = new RealDecimator(
+                                FirDesign.LowPass((pass + stop) * 0.5, taps, 8.6), audioDecim);
+                            OutputRate = OutputRate / audioDecim;
+                        }
+                    }
                     break;
                 case DemodMode.Usb:
                     _ssb = new SsbDemod(options.SsbTaps, 32768, OutputRate, 0.0, true);
@@ -188,7 +274,7 @@ namespace Radiocity.Dsp
             _agc = voice ? new Agc(OutputRate, 40.0, 600.0, 0.30) : new Agc(OutputRate, 25.0, 400.0, 0.30);
             _agcEnabled = options.AgcEnabled;
 
-            _squelch = new Squelch(OutputRate);
+            _squelch = new Squelch(basebandRate, OutputRate);
             if (options.SquelchDb.HasValue)
             {
                 _squelch.Enabled = true;
@@ -201,11 +287,11 @@ namespace Radiocity.Dsp
 
             if (options.BlankerThreshold.HasValue)
             {
-                _blanker = new NoiseBlanker(OutputRate);
+                _blanker = new NoiseBlanker(basebandRate);
                 _blanker.Threshold = options.BlankerThreshold.Value;
             }
 
-            if (options.CorrectImbalance) _imbalance = new IqImbalance(OutputRate);
+            if (options.CorrectImbalance) _imbalance = new IqImbalance(basebandRate);
 
             int block = 32768;
             _i = new float[block];
@@ -213,10 +299,21 @@ namespace Radiocity.Dsp
             _bi = new float[block];
             _bq = new float[block];
             _audio = new float[block];
+            _stereoOut = new float[block * 2];
+            _audioDecimOut = new float[block];
+
+            if (Channels == 0) Channels = 1;
         }
 
         public double SampleRate { get; private set; }
         public int OutputRate { get; private set; }
+
+        /// <summary>
+        /// 1 for mono, 2 for stereo. When 2, Process writes interleaved samples
+        /// and the returned count is frames, not samples.
+        /// </summary>
+        public int Channels { get; private set; }
+
         public int MaxBlock { get { return _i.Length; } }
         public int Taps { get { return _chain.TotalTaps; } }
         public int DecimationStages { get { return _chain.Stages; } }
@@ -240,6 +337,12 @@ namespace Radiocity.Dsp
         /// phase error and the image rejection it implies.
         /// </summary>
         public IqImbalance Imbalance { get { return _imbalance; } }
+
+        /// <summary>True when a 19 kHz pilot is present and the subcarrier is locked.</summary>
+        public bool StereoDetected { get { return _stereo != null && _stereo.Stereo; } }
+
+        /// <summary>Pilot amplitude, for a stereo indicator.</summary>
+        public float StereoPilot { get { return _stereo != null ? _stereo.PilotLevel : 0.0f; } }
 
         /// <summary>Safe to call from any thread; takes effect at the next block.</summary>
         public void SetTune(double hz)
@@ -332,6 +435,29 @@ namespace Radiocity.Dsp
                 case DemodMode.Am: _am.Process(_bi, _bq, m, _audio); break;
                 case DemodMode.Fm: _fm.Process(_bi, _bq, m, _audio); break;
                 default: _ssb.Process(_bi, _bq, m, _audio); break;
+            }
+
+            if (_stereo != null)
+            {
+                // The composite sits in _audio; the decoder turns it into
+                // interleaved L/R at the audio rate.
+                int frames = _stereo.Process(_audio, m, _stereoOut);
+
+                if (_agcEnabled) _stereoAgc.Process(_stereoOut, frames);
+                _squelch.Apply(_stereoOut, frames * 2);
+
+                Array.Copy(_stereoOut, 0, output, 0, frames * 2);
+                return frames;
+            }
+
+            if (_audioDecim != null)
+            {
+                int d = _audioDecim.Process(_audio, m, _audioDecimOut);
+                if (_agcEnabled) _agc.Process(_audioDecimOut, d);
+                _squelch.Apply(_audioDecimOut, d);
+
+                Array.Copy(_audioDecimOut, 0, output, 0, d);
+                return d;
             }
 
             if (_agcEnabled) _agc.Process(_audio, m);

@@ -36,18 +36,25 @@ namespace Radiocity.Web
         private readonly DemodMode _initialMode;
         private readonly double _initialChannel;
         private readonly bool _correctImbalance;
+        private readonly bool _stereo;
         private float? _initialBlanker;
 
         private Timer _reaper;
         private bool _disposed;
 
         public WebRadio(ISampleSource source, double initialFreq, DemodMode mode, double channelHz)
-            : this(source, initialFreq, mode, channelHz, false)
+            : this(source, initialFreq, mode, channelHz, false, false)
         {
         }
 
         public WebRadio(ISampleSource source, double initialFreq, DemodMode mode, double channelHz,
                         bool correctImbalance)
+            : this(source, initialFreq, mode, channelHz, correctImbalance, false)
+        {
+        }
+
+        public WebRadio(ISampleSource source, double initialFreq, DemodMode mode, double channelHz,
+                        bool correctImbalance, bool stereo)
         {
             _hub = new CaptureHub(source);
 
@@ -55,6 +62,7 @@ namespace Radiocity.Web
             _initialMode = mode;
             _initialChannel = channelHz;
             _correctImbalance = correctImbalance;
+            _stereo = stereo;
 
             // The default session exists from the start, so /state answers
             // immediately and the console banner can report real settings.
@@ -123,7 +131,7 @@ namespace Radiocity.Web
                 }
 
                 RadioSession session = new RadioSession(_hub, id, _initialFreq, _initialMode, _initialChannel,
-                                                        _correctImbalance);
+                                                        _correctImbalance, _stereo);
                 session.Configure(_initialMode, _initialChannel, null, _initialBlanker);
                 _sessions[id] = session;
                 return session;
@@ -235,6 +243,7 @@ namespace Radiocity.Web
                 : "0").Append(',');
 
             sb.Append("\"sessions\":").Append(SessionCount).Append(',');
+            sb.Append("\"stereo\":").Append(s.Channels == 2 ? "true" : "false").Append(',');
             sb.Append("\"quadrature\":").Append(_hub.IsQuadrature ? "true" : "false").Append(',');
             sb.Append("\"bandLo\":").Append(_hub.BandLo.ToString("F0", CultureInfo.InvariantCulture)).Append(',');
             sb.Append("\"bandHi\":").Append(_hub.BandHi.ToString("F0", CultureInfo.InvariantCulture)).Append(',');
@@ -308,8 +317,11 @@ namespace Radiocity.Web
         {
             RadioSession s = Lookup(req);
 
+            int channels = s.Channels;
+
             HttpResponse r = new HttpResponse();
-            r.ContentType = "audio/L16;rate=" + RadioSession.AudioRate + ";channels=1";
+            r.ContentType = "audio/L16;rate=" + RadioSession.AudioRate + ";channels=" + channels;
+            r.Headers["X-Channels"] = channels.ToString(CultureInfo.InvariantCulture);
 
             RadioSession.AudioHandle handle = s.AttachAudio();
             float[] buffer = new float[4096];

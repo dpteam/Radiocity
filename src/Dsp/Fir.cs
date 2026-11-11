@@ -138,4 +138,70 @@ namespace Radiocity.Dsp
             return acc;
         }
     }
+
+    /// <summary>
+    /// Real (not complex) FIR followed by integer decimation. Same shape as
+    /// <see cref="ComplexDecimator"/> but half the work, for signals that are
+    /// genuinely real — an FM composite or a demodulated audio stream.
+    /// </summary>
+    public sealed class RealDecimator
+    {
+        private readonly float[] _h;
+        private readonly int _taps;
+        private readonly int _decim;
+        private readonly float[] _hist;
+        private int _pos;
+        private int _cnt;
+
+        public RealDecimator(float[] taps, int decimation)
+        {
+            if (taps == null || taps.Length < 3) throw new ArgumentException("taps");
+            if (decimation < 1) throw new ArgumentOutOfRangeException("decimation");
+
+            _h = taps;
+            _taps = taps.Length;
+            _decim = decimation;
+            _hist = new float[_taps];
+        }
+
+        public int Decimation { get { return _decim; } }
+        public int Taps { get { return _taps; } }
+
+        public int Process(float[] src, int n, float[] dst)
+        {
+            int o = 0;
+            for (int s = 0; s < n; s++)
+            {
+                _hist[_pos] = src[s];
+
+                _pos++;
+                if (_pos == _taps) _pos = 0;
+
+                if (++_cnt >= _decim)
+                {
+                    _cnt = 0;
+
+                    float acc = 0.0f;
+                    int idx = _pos - 1;
+                    if (idx < 0) idx += _taps;
+
+                    for (int k = 0; k < _taps; k++)
+                    {
+                        acc += _h[k] * _hist[idx];
+                        if (--idx < 0) idx = _taps - 1;
+                    }
+
+                    dst[o++] = acc;
+                }
+            }
+            return o;
+        }
+
+        public void Reset()
+        {
+            Array.Clear(_hist, 0, _hist.Length);
+            _pos = 0;
+            _cnt = 0;
+        }
+    }
 }

@@ -33,6 +33,7 @@ namespace Radiocity.Web
         private readonly RingBuffer _inRingQ = new RingBuffer(1 << 17);
         private readonly bool _quadrature;
         private readonly bool _correctImbalance;
+        private readonly bool _stereo;
 
         private double _freq;
         private DemodMode _mode;
@@ -49,13 +50,14 @@ namespace Radiocity.Web
         private bool _disposed;
 
         internal RadioSession(CaptureHub hub, string id, double freq, DemodMode mode, double channelHz,
-                              bool correctImbalance)
+                              bool correctImbalance, bool stereo)
         {
             _hub = hub;
             _id = id;
             _rate = hub.SampleRate;
             _quadrature = hub.IsQuadrature;
             _correctImbalance = correctImbalance;
+            _stereo = stereo;
 
             _freq = freq;
             _mode = mode;
@@ -80,6 +82,10 @@ namespace Radiocity.Web
         public float? BlankerThreshold { get { lock (_configLock) return _blankerThreshold; } }
         public float LevelDb { get { return _levelDb; } }
         public bool SquelchOpen { get { return _squelchOpen; } }
+
+        /// <summary>1 for mono, 2 for FM stereo. Audio is interleaved when 2.</summary>
+        public int Channels { get { return _channels; } }
+        private volatile int _channels = 1;
 
         /// <summary>Filter cost of this session's chain, once it has been built.</summary>
         public double FilterCost { get { return _filterCost; } }
@@ -227,11 +233,17 @@ namespace Radiocity.Web
         {
             float[] block = new float[32768];
             float[] blockQ = new float[32768];
-            float[] audio = new float[32768];
+            float[] audio = new float[32768 * 2];
             float[] play = new float[32768 * 4 + 64];
+
+            float[] leftBuf = new float[32768];
+            float[] rightBuf = new float[32768];
+            float[] leftOut = new float[32768 * 4 + 64];
+            float[] rightOut = new float[32768 * 4 + 64];
 
             Receiver rx = null;
             InterpolatingResampler resampler = null;
+            InterpolatingResampler resamplerQ = null;
             int seenGeneration = -1;
 
             while (_running)
@@ -265,13 +277,20 @@ namespace Radiocity.Web
                     {
                         options.DeviationHz = 75000.0;
                         options.DeemphasisUs = 50.0;
+                        options.FmStereo = _stereo;
                     }
                     if (mode == DemodMode.Cw) options.BfoHz = 700.0;
 
                     options.Decimation = Math.Max(1, (int)Math.Round((double)_rate / 12000.0));
 
                     rx = new Receiver(_rate, freq, options);
+                    _channels = rx.Channels;
+
                     resampler = (rx.OutputRate == AudioRate)
+                        ? null
+                        : new InterpolatingResampler(rx.OutputRate, AudioRate);
+
+                    resamplerQ = (resampler == null || rx.Channels != 2)
                         ? null
                         : new InterpolatingResampler(rx.OutputRate, AudioRate);
 
@@ -314,10 +333,37 @@ namespace Radiocity.Web
                 _squelchOpen = rx.Squelch.Open;
 
                 int produced;
+
                 if (resampler == null)
                 {
-                    Array.Copy(audio, play, m);
-                    produced = m;
+                    // Mono or stereo, the output is already at the audio rate.
+                    Array.Copy(audio, play, m * _channels);
+                    produced = m * _channels;
+                }
+                else if (_channels == 2)
+                {
+                    // Resample the two channels independently, then interleave.
+                    // A mono resampler applied to interleaved samples would
+                    // resample the left/right sequence as if it were one signal.
+                    int frames = m;
+                    int half = frames;
+                    for (int k = 0; k < half; k++)
+                    {
+                        leftBuf[k] = audio[k * 2];
+                        rightBuf[k] = audio[k * 2 + 1];
+                    }
+
+                    int wl = resampler.Process(leftBuf, half, leftOut, leftOut.Length);
+                    int wr = resamplerQ.Process(rightBuf, half, rightOut, rightOut.Length);
+                    int w = Math.Min(wl, wr);
+
+                    for (int k = 0; k < w; k++)
+                    {
+                        play[k * 2] = leftOut[k];
+                        play[k * 2 + 1] = rightOut[k];
+                    }
+
+                    produced = w * 2;
                 }
                 else
                 {

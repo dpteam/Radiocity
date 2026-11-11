@@ -196,6 +196,7 @@
   </div>
   <div class="row" style="margin-left:auto">
     <span class="badge" id="sessBadge">1 receiver</span>
+    <span class="badge" id="stereoBadge">mono</span>
     <span class="badge" id="squelchBadge">squelch</span>
     <button id="audioBtn" class="primary">▶ Listen</button>
   </div>
@@ -413,6 +414,12 @@
     updateAxis();
     if (typeof s.level === "number") updateLevel(s.level);
 
+    var stereoBadge = document.getElementById("stereoBadge");
+    if (stereoBadge) {
+      if (s.stereo) { stereoBadge.className = "badge on"; stereoBadge.textContent = "stereo"; }
+      else { stereoBadge.className = "badge"; stereoBadge.textContent = "mono"; }
+    }
+
     var badge = document.getElementById("squelchBadge");
     if (s.open === false) { badge.className = "badge"; badge.textContent = "muted"; }
     else { badge.className = "badge on"; badge.textContent = "squelch"; }
@@ -508,11 +515,13 @@
 
   var audioCtx = null;
   var node = null;
-  var ring = new Float32Array(1 << 15);
+  var ringL = new Float32Array(1 << 15);
+  var ringR = new Float32Array(1 << 15);
   var ringRead = 0;
   var ringWrite = 0;
   var reader = null;
   var pumping = false;
+  var audioChannels = 1;
 
   function startAudio() {
     if (audioCtx) return;
@@ -525,17 +534,24 @@
 
     // ScriptProcessorNode is deprecated but works everywhere, including
     // browsers that would refuse an AudioWorklet loaded from a blob URL.
-    node = audioCtx.createScriptProcessor(2048, 0, 1);
+    // Two output channels, because FM stereo is a real thing.
+    node = audioCtx.createScriptProcessor(2048, 0, 2);
     node.onaudioprocess = function (e) {
-      var out = e.outputBuffer.getChannelData(0);
-      var mask = ring.length - 1;
-      for (var i = 0; i < out.length; i++) {
-        if (ringRead === ringWrite) { out[i] = 0; continue; }
-        out[i] = ring[ringRead & mask];
+      var l = e.outputBuffer.getChannelData(0);
+      var r = e.outputBuffer.getChannelData(1);
+      var mask = ringL.length - 1;
+      var stereo = audioChannels === 2;
+
+      for (var i = 0; i < l.length; i++) {
+        if (ringRead === ringWrite) { l[i] = 0; r[i] = 0; continue; }
+        var idx = ringRead & mask;
+        l[i] = ringL[idx];
+        r[i] = stereo ? ringR[idx] : ringL[idx];
         ringRead++;
       }
+
       // Resynchronise if the producer lapped us.
-      if (ringWrite - ringRead > ring.length) ringRead = ringWrite - ring.length;
+      if (ringWrite - ringRead > ringL.length) ringRead = ringWrite - ringL.length;
     };
     node.connect(audioCtx.destination);
 
@@ -560,6 +576,8 @@
         if (!res.body || !res.body.getReader) {
           throw new Error("streaming fetch is not supported by this browser");
         }
+        var ch = parseInt(res.headers.get("X-Channels") || "1", 10);
+        audioChannels = (ch === 2) ? 2 : 1;
         reader = res.body.getReader();
         return readLoop();
       })
@@ -589,14 +607,16 @@
       if (even < bytes.length) carry = bytes.slice(even);
 
       var view = new DataView(bytes.buffer, bytes.byteOffset, even);
-      var mask = ring.length - 1;
+      var mask = ringL.length - 1;
+      var stereo = audioChannels === 2;
+      var step = stereo ? 4 : 2;          // bytes per frame
 
-      for (var i = 0; i < even; i += 2) {
-        var s = view.getInt16(i, true) / 32768;
-        if (ringWrite - ringRead < ring.length - 1) {
-          ring[ringWrite & mask] = s;
-          ringWrite++;
-        }
+      for (var i = 0; i + step <= even; i += step) {
+        if (ringWrite - ringRead >= ringL.length - 1) break;
+        var idx = ringWrite & mask;
+        ringL[idx] = view.getInt16(i, true) / 32768;
+        if (stereo) ringR[idx] = view.getInt16(i + 2, true) / 32768;
+        ringWrite++;
       }
 
       return readLoop();

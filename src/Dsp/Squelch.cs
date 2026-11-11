@@ -30,6 +30,18 @@ namespace Radiocity.Dsp
         public bool Enabled;
 
         public Squelch(double sampleRate)
+            : this(sampleRate, sampleRate)
+        {
+        }
+
+        /// <param name="sampleRate">Rate the power detector is fed at.</param>
+        /// <param name="gateRate">
+        /// Rate the gate is applied at. They differ for FM stereo, where the
+        /// detector sees the composite at baseband but the gate multiplies audio
+        /// at the output rate; using one rate for both would make the ramp
+        /// four times slower than intended.
+        /// </param>
+        public Squelch(double sampleRate, double gateRate)
         {
             // 20 ms power estimate: long enough to average over speech syllables,
             // short enough that the gate does not lag the signal.
@@ -38,8 +50,8 @@ namespace Radiocity.Dsp
 
             // 2 ms to open, 40 ms to close. Opening fast avoids chopping the first
             // syllable; closing slowly avoids chattering on a fading carrier.
-            _attack = (float)(1.0 - Math.Exp(-1.0 / (sampleRate * 0.002)));
-            _release = (float)(1.0 - Math.Exp(-1.0 / (sampleRate * 0.040)));
+            _attack = (float)(1.0 - Math.Exp(-1.0 / (gateRate * 0.002)));
+            _release = (float)(1.0 - Math.Exp(-1.0 / (gateRate * 0.040)));
 
             ThresholdDb = -100.0f;
             Enabled = false;

@@ -241,6 +241,71 @@ jobs:
             quad-test.err
           if-no-files-found: ignore
 
+      # FM stereo changes the shape of the audio stream, so it gets its own check:
+      # the session must report stereo and /audio must declare two channels.
+      - name: Stereo integration test
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Get-Process Radiocity -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+
+          $proc = Start-Process -FilePath "bin\Radiocity.exe" -ArgumentList "web","--sim-iq","--port","8097","--rate","192000","--mode","fm","--stereo" -PassThru -WindowStyle Hidden -RedirectStandardOutput "stereo-test.log" -RedirectStandardError "stereo-test.err"
+
+          try {
+            $ok = $false
+            for ($i = 0; $i -lt 60; $i++) {
+              Start-Sleep -Milliseconds 250
+              try {
+                $probe = New-Object System.Net.Sockets.TcpClient
+                $probe.Connect("127.0.0.1", 8097)
+                $probe.Close()
+                $ok = $true
+                break
+              } catch { }
+            }
+            if (-not $ok) { throw "stereo server did not open port 8097" }
+
+            $state = $null
+            for ($i = 0; $i -lt 20; $i++) {
+              try { $state = Invoke-RestMethod "http://localhost:8097/state" -TimeoutSec 10; break } catch { Start-Sleep -Milliseconds 250 }
+            }
+            if ($null -eq $state) { throw "GET /state never answered" }
+
+            if ($state.mode -ne "FM") { throw "mode is $($state.mode), expected FM" }
+            if ($state.stereo -ne $true) { throw "session did not report stereo" }
+            Write-Host "state: mode=$($state.mode) stereo=$($state.stereo) rate=$($state.rate)"
+
+            $client = New-Object System.Net.Sockets.TcpClient
+            $client.Connect("127.0.0.1", 8097)
+            $stream = $client.GetStream()
+            $stream.ReadTimeout = 8000
+            $req = [Text.Encoding]::ASCII.GetBytes("GET /audio HTTP/1.1`r`nHost: localhost`r`n`r`n")
+            $stream.Write($req, 0, $req.Length)
+
+            $buffer = New-Object byte[] 4096
+            $n = $stream.Read($buffer, 0, 4096)
+            $head = [Text.Encoding]::ASCII.GetString($buffer, 0, $n)
+            $client.Close()
+
+            if ($head -notmatch "channels=2") { throw "/audio did not declare two channels" }
+            if ($head -notmatch "X-Channels: 2") { throw "missing X-Channels header" }
+            Write-Host "audio declares two channels"
+          }
+          finally {
+            if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
+          }
+
+      - name: Upload stereo test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stereo-test-log
+          path: |
+            stereo-test.log
+            stereo-test.err
+          if-no-files-found: ignore
+
       # The icon is generated, not hand-edited. Rather than compare bytes —
       # GDI+ antialiasing differs between Windows versions, so a hash check
       # would fail for reasons outside anyone's control — parse the file and

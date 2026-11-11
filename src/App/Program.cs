@@ -27,6 +27,9 @@ namespace Radiocity.App
         /// </summary>
         private static float? BlankerThreshold;
 
+        /// <summary>Decode FM stereo. Set with -stereo / --stereo.</summary>
+        private static bool StereoRequested;
+
         private static int Main(string[] args)
         {
             // A pool thread that throws takes the whole process down. Say why,
@@ -81,6 +84,7 @@ namespace Radiocity.App
                 else if (a == "-b24") CaptureBits = 24;
                 else if (a == "-b32") CaptureBits = 32;
                 else if (a == "-nb") BlankerThreshold = 12.0f;
+                else if (a == "-stereo" || a == "--stereo") StereoRequested = true;
                 else if (a.StartsWith("-nb") && a.Length > 3)
                 {
                     float t;
@@ -127,6 +131,7 @@ namespace Radiocity.App
             Console.WriteLine("  rate defaults to 48000; 192000 reaches to 96 kHz and is required for DCF77.");
             Console.WriteLine("  add -b24 (or -b8/-b16/-b32) to any command to pick the capture depth.");
             Console.WriteLine("  add -nb to enable the impulse noise blanker (-nb20 for a looser threshold).");
+            Console.WriteLine("  add -stereo for FM stereo (needs --rate 192000 on 'web', or 128 kHz+ capture).");
             Console.WriteLine("  add --sim to 'web' to serve a synthetic band, no sound card needed.");
             Console.WriteLine();
             Console.WriteLine("  Reality check: a sound card ADC stops at its own sample rate, so it hears");
@@ -145,6 +150,8 @@ namespace Radiocity.App
             ok &= RunAmTest();
             Console.WriteLine();
             ok &= RunFmTest();
+            Console.WriteLine();
+            ok &= RunFmStereoTest();
             Console.WriteLine();
             ok &= RunSsbTest();
             Console.WriteLine();
@@ -633,6 +640,141 @@ namespace Radiocity.App
             return ok;
         }
 
+        private static bool RunFmStereoTest()
+        {
+            // A stereo broadcast sends M = (L+R)/2, S = (L-R)/2, the S sideband on
+            // a 38 kHz subcarrier, and a 19 kHz pilot to say where that subcarrier
+            // is. This builds exactly that, FM-modulates it, and checks that two
+            // different tones come back out of two different channels.
+            //
+            // The FM signal is generated as complex baseband rather than as a real
+            // RF tone, and that is not a shortcut. Mixing a real signal down by a
+            // carrier creates an image at -(2*fc + df); with +-25 kHz of deviation
+            // and a 12 kHz carrier that image lands back inside the band and
+            // aliases, because a sound card has no analogue filter in this test.
+            // A quadrature front end is what makes wideband FM possible at all,
+            // so the test exercises that path.
+            const double fs = 192000.0;
+            const double leftTone = 1000.0;
+            const double rightTone = 3000.0;
+            const double deviation = 10000.0;
+
+            int n = (int)(fs * 4.0);
+
+            float[] mpx = new float[n];
+            for (int k = 0; k < n; k++)
+            {
+                double t = k / fs;
+                double l = 0.5 * Math.Cos(2.0 * Math.PI * leftTone * t);
+                double r = 0.5 * Math.Cos(2.0 * Math.PI * rightTone * t);
+
+                double m = (l + r) * 0.5;
+                double s = (l - r) * 0.5;
+
+                mpx[k] = (float)(m + s * Math.Cos(2.0 * Math.PI * 38000.0 * t) +
+                                 0.1 * Math.Cos(2.0 * Math.PI * 19000.0 * t));
+            }
+
+            float[] bi = new float[n];
+            float[] bq = new float[n];
+            double phase = 0.0;
+            for (int k = 0; k < n; k++)
+            {
+                bi[k] = (float)Math.Cos(phase);
+                bq[k] = (float)Math.Sin(phase);
+                phase += 2.0 * Math.PI * (deviation * mpx[k]) / fs;
+            }
+
+            ReceiverOptions o = ReceiverOptions.FmStereoMode(1);
+            o.DeemphasisUs = 0.0;          // keep the test tones flat
+            o.ChannelHz = 180000.0;
+            o.DeviationHz = deviation;
+
+            Receiver rx = new Receiver(fs, 0.0, o);
+            float[] output = RunComplex(rx, bi, bq);
+
+            if (rx.Channels != 2)
+            {
+                Console.WriteLine("FM stereo self-test");
+                Console.WriteLine("  FAIL: receiver did not switch to two channels");
+                return false;
+            }
+
+            double lTone = MeasureChannel(output, rx.OutputRate, leftTone, 0);
+            double rTone = MeasureChannel(output, rx.OutputRate, rightTone, 1);
+            double lCross = MeasureChannel(output, rx.OutputRate, rightTone, 0);
+            double rCross = MeasureChannel(output, rx.OutputRate, leftTone, 1);
+
+            double leftSep = Db(lTone / Math.Max(lCross, 1e-12));
+            double rightSep = Db(rTone / Math.Max(rCross, 1e-12));
+
+            Console.WriteLine("FM stereo self-test");
+            Console.WriteLine("  L carries " + leftTone.ToString("F0", Inv) + " Hz, R carries " +
+                              rightTone.ToString("F0", Inv) + " Hz, pilot 19 kHz, subcarrier 38 kHz");
+            Console.WriteLine("  audio rate " + rx.OutputRate + " Hz, " + rx.Channels + " channels, pilot " +
+                              rx.StereoPilot.ToString("F3", Inv) +
+                              " (" + (rx.StereoDetected ? "locked" : "no lock") + ")");
+            Console.WriteLine("  L: wanted " + lTone.ToString("F3", Inv) + ", leaked " + lCross.ToString("F3", Inv) +
+                              "  separation " + leftSep.ToString("F1", Inv) + " dB");
+            Console.WriteLine("  R: wanted " + rTone.ToString("F3", Inv) + ", leaked " + rCross.ToString("F3", Inv) +
+                              "  separation " + rightSep.ToString("F1", Inv) + " dB");
+
+            bool ok = leftSep > 30.0 && rightSep > 30.0;
+            Console.WriteLine(ok ? "  PASS" : "  FAIL: channels are not separated");
+            return ok;
+        }
+
+        /// <summary>Runs complex baseband through the chain, as a quadrature front end would.</summary>
+        private static float[] RunComplex(Receiver rx, float[] i, float[] q)
+        {
+            int ch = rx.Channels;
+            int n = i.Length;
+
+            float[] output = new float[(n + rx.MaxBlock) * ch];
+            float[] blockI = new float[rx.MaxBlock];
+            float[] blockQ = new float[rx.MaxBlock];
+            float[] audio = new float[rx.MaxBlock * ch];
+            int produced = 0, pos = 0;
+
+            while (pos < n)
+            {
+                int chunk = Math.Min(rx.MaxBlock, n - pos);
+                Array.Copy(i, pos, blockI, 0, chunk);
+                Array.Copy(q, pos, blockQ, 0, chunk);
+                int m = rx.ProcessBaseband(blockI, blockQ, chunk, audio);
+                Array.Copy(audio, 0, output, produced, m * ch);
+                produced += m * ch;
+                pos += chunk;
+            }
+
+            float[] trimmed = new float[produced];
+            Array.Copy(output, trimmed, produced);
+            return trimmed;
+        }
+
+        /// <summary>Goertzel on one channel of an interleaved buffer, last second.</summary>
+        private static double MeasureChannel(float[] interleaved, int rate, double hz, int channel)
+        {
+            int frames = interleaved.Length / 2;
+            int count = Math.Min(rate, frames);
+            int offset = frames - count;
+
+            double w = 2.0 * Math.PI * hz / rate;
+            double coeff = 2.0 * Math.Cos(w);
+            double s1 = 0.0, s2 = 0.0;
+
+            for (int k = 0; k < count; k++)
+            {
+                double s0 = interleaved[(offset + k) * 2 + channel] + coeff * s1 - s2;
+                s2 = s1;
+                s1 = s0;
+            }
+
+            double re = s1 - s2 * Math.Cos(w);
+            double im = s2 * Math.Sin(w);
+            return Math.Sqrt(re * re + im * im) * 2.0 / count;
+        }
+
         private static bool RunImbalanceTest()
         {
             // A real quadrature front end has two analogue paths that are never
@@ -837,9 +979,10 @@ namespace Radiocity.App
 
         private static float[] Run(Receiver rx, float[] input)
         {
-            float[] output = new float[input.Length + rx.MaxBlock];
+            int ch = rx.Channels;
+            float[] output = new float[(input.Length + rx.MaxBlock) * ch];
             float[] block = new float[rx.MaxBlock];
-            float[] audio = new float[rx.MaxBlock];
+            float[] audio = new float[rx.MaxBlock * ch];
             int produced = 0, pos = 0;
 
             while (pos < input.Length)
@@ -847,8 +990,8 @@ namespace Radiocity.App
                 int chunk = Math.Min(rx.MaxBlock, input.Length - pos);
                 Array.Copy(input, pos, block, 0, chunk);
                 int m = rx.Process(block, chunk, audio);
-                Array.Copy(audio, 0, output, produced, m);
-                produced += m;
+                Array.Copy(audio, 0, output, produced, m * ch);
+                produced += m * ch;
                 pos += chunk;
             }
 
@@ -1066,27 +1209,35 @@ namespace Radiocity.App
             ReceiverOptions o = ParseOptions(mode, channel, decim);
             if (channel > 0.0) o.ChannelHz = channel;
 
+            // Stereo is opt-in: it needs a wide capture and doubles the output.
+            if (StereoRequested) o.FmStereo = true;
+
             Receiver rx = new Receiver(rate, tune, o);
+
+            int channels = rx.Channels;
 
             // The channel rate is a division of the capture rate, so it is almost
             // never a rate the sound card will accept (12 kHz, 7.5 kHz, ...).
-            int audioRate = PickAudioRate(rx.OutputRate);
+            // Stereo is the exception: the stereo decoder already outputs 48 kHz,
+            // which every card accepts, so it is played as-is.
+            int audioRate = (channels == 2) ? rx.OutputRate : PickAudioRate(rx.OutputRate);
             InterpolatingResampler resampler = (audioRate == rx.OutputRate)
                 ? null
                 : new InterpolatingResampler(rx.OutputRate, audioRate);
 
             Console.WriteLine("listening on " + tune.ToString("F0", Inv) + " Hz, " + rx.Mode +
+                              (channels == 2 ? " (stereo)" : "") +
                               ", capture " + rate + " Hz, channel " + o.ChannelHz.ToString("F0", Inv) +
                               " Hz, audio " + audioRate + " Hz");
             Console.WriteLine("press Ctrl+C to stop");
 
             RingBuffer inRing = new RingBuffer(1 << 18);
             float[] block = new float[rx.MaxBlock];
-            float[] audio = new float[rx.MaxBlock];
-            float[] play = new float[rx.MaxBlock * 4 + 64];
+            float[] audio = new float[rx.MaxBlock * channels];
+            float[] play = new float[rx.MaxBlock * 4 * channels + 64];
 
             using (WaveIn capture = new WaveIn(rate, 1, CaptureBits))
-            using (WaveOut output = new WaveOut(audioRate, 1, 16))
+            using (WaveOut output = new WaveOut(audioRate, channels, 16))
             {
                 capture.DataAvailable += delegate(float[] buf, int frames) { inRing.Write(buf, 0, frames); };
                 capture.Start();
@@ -1104,7 +1255,8 @@ namespace Radiocity.App
 
                     if (resampler == null)
                     {
-                        output.Write(audio, m);
+                        // Already at the card's rate. m is frames, samples are m*channels.
+                        output.Write(audio, m * channels);
                     }
                     else
                     {
@@ -1287,7 +1439,7 @@ namespace Radiocity.App
                 }
             }
 
-            using (WebRadio radio = new WebRadio(source, freq, mode, DefaultChannel(mode), correctImbalance))
+            using (WebRadio radio = new WebRadio(source, freq, mode, DefaultChannel(mode), correctImbalance, StereoRequested))
             using (HttpServer server = new HttpServer(port, radio.Handle))
             {
                 if (BlankerThreshold.HasValue) radio.SetBlanker(BlankerThreshold);
