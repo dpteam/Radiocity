@@ -132,7 +132,7 @@ namespace Radiocity.Web
 
                 RadioSession session = new RadioSession(_hub, id, _initialFreq, _initialMode, _initialChannel,
                                                         _correctImbalance, _stereo);
-                session.Configure(_initialMode, _initialChannel, null, _initialBlanker, null);
+                session.Configure(_initialMode, _initialChannel, null, _initialBlanker, null, null);
                 _sessions[id] = session;
                 return session;
             }
@@ -269,6 +269,23 @@ namespace Radiocity.Web
             sb.Append("\"ctcssWanted\":").Append(expected.HasValue
                 ? expected.Value.ToString("F1", CultureInfo.InvariantCulture) : "0").Append(',');
             sb.Append("\"ctcssOpen\":").Append(toneOpen ? "true" : "false").Append(',');
+
+            // DCS: same idea, but the code is octal and rotations of the same
+            // transmission decode differently, so "matches" is a set membership
+            // test rather than an equality (see Dcs.SameCode).
+            DcsDecoder dcs = s.Dcs;
+            int? wantedDcs = s.DcsCode;
+
+            bool dcsOpen = wantedDcs == null ||
+                           (dcs != null && dcs.Synced &&
+                            (wantedDcs.Value <= 0 || Radiocity.Dsp.Dcs.SameCode(dcs.Code, wantedDcs.Value)));
+
+            sb.Append("\"dcs\":\"").Append(dcs != null && dcs.Synced
+                ? Radiocity.Dsp.Dcs.Format(dcs.Code) : "").Append("\",");
+            sb.Append("\"dcsWanted\":\"").Append(wantedDcs.HasValue && wantedDcs.Value > 0
+                ? Radiocity.Dsp.Dcs.Format(wantedDcs.Value) : "").Append("\",");
+            sb.Append("\"dcsInverted\":").Append(dcs != null && dcs.Inverted ? "true" : "false").Append(',');
+            sb.Append("\"dcsOpen\":").Append(dcsOpen ? "true" : "false").Append(',');
             sb.Append("\"quadrature\":").Append(_hub.IsQuadrature ? "true" : "false").Append(',');
             sb.Append("\"bandLo\":").Append(_hub.BandLo.ToString("F0", CultureInfo.InvariantCulture)).Append(',');
             sb.Append("\"bandHi\":").Append(_hub.BandHi.ToString("F0", CultureInfo.InvariantCulture)).Append(',');
@@ -332,6 +349,21 @@ namespace Radiocity.Web
                     ctcss = (cv < 0.0) ? (double?)null : (cv > 0.0 ? Ctcss.Nearest(cv) : 0.0);
             }
 
+            // dcs: -1 or absent keeps the setting, 0 means "any code", anything
+            // else is an octal code such as 023.
+            int? dcs = s.DcsCode;
+            string dcsText = req.Get("dcs");
+            if (!string.IsNullOrEmpty(dcsText))
+            {
+                if (dcsText == "-1") dcs = null;
+                else if (dcsText == "0") dcs = 0;
+                else
+                {
+                    try { dcs = Radiocity.Dsp.Dcs.Parse(dcsText); }
+                    catch (FormatException) { }
+                }
+            }
+
             // Clamp inside what the receiver can actually see. For a real source
             // that is 0..rate/2; for a quadrature front end it is the full
             // complex band around the local oscillator.
@@ -343,10 +375,11 @@ namespace Radiocity.Web
             bool needsRebuild = (mode != s.Mode) || Math.Abs(channel - s.ChannelHz) > 1.0 ||
                                 !Nullable.Equals(squelch, s.SquelchDb) ||
                                 !Nullable.Equals(blanker, s.BlankerThreshold) ||
-                                !Nullable.Equals(ctcss, s.CtcssTone);
+                                !Nullable.Equals(ctcss, s.CtcssTone) ||
+                                !Nullable.Equals(dcs, s.DcsCode);
 
             s.Tune(freq);
-            if (needsRebuild) s.Configure(mode, channel, squelch, blanker, ctcss);
+            if (needsRebuild) s.Configure(mode, channel, squelch, blanker, ctcss, dcs);
 
             return HandleState(req);
         }

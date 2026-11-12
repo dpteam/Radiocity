@@ -430,6 +430,49 @@ chatter. A freshly built receiver starts muted and needs one full analysis
 window (1 s) before it can open — correct, but worth knowing when a test appears
 to fail immediately after a mode change.
 
+## DCS — `src/Dsp/Dcs.cs`
+
+DCS replaces the CTCSS tone with data: a 23-bit Golay code word repeating at
+134.4 bps. Three properties make it work, and one makes it awkward.
+
+**The code corrects three errors.** 12 data bits, 11 check bits, and (23,12) is
+*perfect* — there are exactly 2048 syndromes and exactly 2048 error patterns of
+weight 0–3 (1 + 23 + 253 + 1771), so every syndrome maps to exactly one
+correction and the decoder is a single table lookup. The table is built once at
+startup by enumerating every pattern of weight ≤ 3.
+
+**There is no framing.** No preamble, no frame marker, no bit clock — just the
+same word repeating. Sync has to come from the data. Two things make that
+possible: the 11 check bits make a random 23-bit window very unlikely to be a
+valid word, and a valid DCS word additionally requires the top three of its
+twelve data bits to be zero.
+
+**Bit timing comes free.** An NRZ transition can only fall on a bit boundary, so
+every edge is a clock reference. The loop nudges the sampling phase toward each
+transition; no separate timing recovery is needed.
+
+**And the awkward part: the code is cyclic.** Every rotation of a code word is
+also a code word, and decodes to a *different* code. Since there is no framing,
+the receiver cannot know where the word begins, so one transmission legitimately
+decodes to any of several codes depending on the alignment it happens to lock
+onto. For code 023 the aliases are 023, 046, 114, 231, 462 and 145.
+
+That is a property of the code, not a bug, and the resolution is to stop
+comparing numbers and start comparing transmissions: `Dcs.SameCode` enumerates
+the alignments of the requested code and accepts any of them. A repeater
+transmitting 023 opens a receiver set to 023 whatever alignment it locks to.
+
+**Inverted codes** are the same word with every bit flipped, and are common
+enough that a receiver ignoring them looks broken on half a repeater's channels.
+Detection is by trying both polarities and preferring the one that needed fewer
+corrections; on a tie, the previous decision wins, because the code repeats and
+continuity is evidence.
+
+**Slicing** is against a tracked peak-to-peak midpoint, not the mean. A Golay
+word is not balanced — some have twenty ones and three zeros — so the mean of a
+repeating unbalanced word sits nowhere near the middle of its two levels, and
+slicing at the mean would read every bit as zero. (It did, the first time.)
+
 ## Performance notes
 
 Everything in `Process()` is preallocated. The whole AM chain at 48 kHz runs in

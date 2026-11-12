@@ -41,6 +41,7 @@ namespace Radiocity.Web
         private float? _squelchDb;
         private float? _blankerThreshold;
         private double? _ctcssTone;
+        private int? _dcsCode;
         private int _generation;
 
         private Thread _thread;
@@ -82,6 +83,7 @@ namespace Radiocity.Web
         public float? SquelchDb { get { lock (_configLock) return _squelchDb; } }
         public float? BlankerThreshold { get { lock (_configLock) return _blankerThreshold; } }
         public double? CtcssTone { get { lock (_configLock) return _ctcssTone; } }
+        public int? DcsCode { get { lock (_configLock) return _dcsCode; } }
         public float LevelDb { get { return _levelDb; } }
         public bool SquelchOpen { get { return _squelchOpen; } }
 
@@ -93,9 +95,13 @@ namespace Radiocity.Web
         public RdsDecoder Rds { get { return _rds; } }
         private volatile RdsDecoder _rds;
         private volatile CtcssDecoder _ctcss;
+        private volatile DcsDecoder _dcs;
 
         /// <summary>CTCSS detector, or null when the current receiver has none.</summary>
         public CtcssDecoder Ctcss { get { return _ctcss; } }
+
+        /// <summary>DCS decoder, or null when the current receiver has none.</summary>
+        public DcsDecoder Dcs { get { return _dcs; } }
 
         /// <summary>Filter cost of this session's chain, once it has been built.</summary>
         public double FilterCost { get { return _filterCost; } }
@@ -121,11 +127,11 @@ namespace Radiocity.Web
 
         public void Configure(DemodMode mode, double channelHz, float? squelchDb, float? blanker)
         {
-            Configure(mode, channelHz, squelchDb, blanker, null);
+            Configure(mode, channelHz, squelchDb, blanker, null, null);
         }
 
         public void Configure(DemodMode mode, double channelHz, float? squelchDb, float? blanker,
-                              double? ctcssTone)
+                              double? ctcssTone, int? dcsCode)
         {
             lock (_configLock)
             {
@@ -134,6 +140,7 @@ namespace Radiocity.Web
                 _squelchDb = squelchDb;
                 _blankerThreshold = blanker;
                 _ctcssTone = ctcssTone;
+                _dcsCode = dcsCode;
             }
 
             Interlocked.Increment(ref _generation);
@@ -272,6 +279,7 @@ namespace Radiocity.Web
                     float? squelch;
                     float? blanker;
                     double? ctcss;
+                    int? dcs;
                     double freq;
 
                     lock (_configLock)
@@ -281,6 +289,7 @@ namespace Radiocity.Web
                         squelch = _squelchDb;
                         blanker = _blankerThreshold;
                         ctcss = _ctcssTone;
+                        dcs = _dcsCode;
                         freq = _freq;
                     }
 
@@ -292,6 +301,7 @@ namespace Radiocity.Web
                     options.SquelchDb = squelch;
                     options.BlankerThreshold = blanker;
                     options.CtcssTone = ctcss;
+                    options.DcsCode = dcs;
                     options.CorrectImbalance = _quadrature && _correctImbalance;
                     if (mode == DemodMode.Fm)
                     {
@@ -313,6 +323,7 @@ namespace Radiocity.Web
                     _channels = rx.Channels;
                     _rds = rx.Rds;
                     _ctcss = rx.Ctcss;
+                    _dcs = rx.Dcs;
 
                     resampler = (rx.OutputRate == AudioRate)
                         ? null

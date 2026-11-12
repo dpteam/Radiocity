@@ -433,6 +433,80 @@ jobs:
             nfm-test.err
           if-no-files-found: ignore
 
+      # DCS: the Golay layer is exact, and the interesting behaviour is that a
+      # rotation of the requested code must still open the gate — the code is
+      # cyclic, so the same transmission decodes differently depending on where
+      # the receiver happens to put the frame boundary.
+      - name: DCS integration test
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Get-Process Radiocity -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+
+          $proc = Start-Process -FilePath "bin\Radiocity.exe" -ArgumentList "web","--sim-dcs","--port","8094","--rate","48000" -PassThru -WindowStyle Hidden -RedirectStandardOutput "dcs-test.log" -RedirectStandardError "dcs-test.err"
+
+          try {
+            $ok = $false
+            for ($i = 0; $i -lt 60; $i++) {
+              Start-Sleep -Milliseconds 250
+              try {
+                $probe = New-Object System.Net.Sockets.TcpClient
+                $probe.Connect("127.0.0.1", 8094)
+                $probe.Close()
+                $ok = $true
+                break
+              } catch { }
+            }
+            if (-not $ok) { throw "DCS server did not open port 8094" }
+
+            $state = $null
+            for ($i = 0; $i -lt 40; $i++) {
+              Start-Sleep -Milliseconds 500
+              try { $state = Invoke-RestMethod "http://localhost:8094/state" -TimeoutSec 10 } catch { continue }
+              if ($state.mode -eq "NFM" -and $state.dcs -ne "") { break }
+            }
+            if ($null -eq $state) { throw "GET /state never answered" }
+
+            Write-Host "state: mode=$($state.mode) dcs=$($state.dcs)"
+            if ($state.mode -ne "NFM") { throw "mode is $($state.mode), expected NFM" }
+            if ($state.dcs -eq "") { throw "no DCS code decoded" }
+
+            # The code the receiver reports is a legitimate alignment alias of
+            # 023, so accept any alias the encoder can produce.
+            $detected = $state.dcs
+            if ($detected -notin @("023", "046", "114", "231", "462", "145")) {
+              throw "unexpected DCS code: $detected"
+            }
+
+            # Asking for the transmitted code must open the gate.
+            Invoke-RestMethod "http://localhost:8094/tune" -Method POST -Body "f=0&mode=nfm&bw=11000&dcs=023" -TimeoutSec 10 | Out-Null
+            Start-Sleep -Seconds 3
+            $match = Invoke-RestMethod "http://localhost:8094/state" -TimeoutSec 10
+            if ($match.dcsOpen -ne $true) { throw "gate did not open for the transmitted code" }
+            Write-Host "requested 023: gate open"
+
+            # A code from a different transmission must not.
+            Invoke-RestMethod "http://localhost:8094/tune" -Method POST -Body "f=0&mode=nfm&bw=11000&dcs=754" -TimeoutSec 10 | Out-Null
+            Start-Sleep -Seconds 3
+            $other = Invoke-RestMethod "http://localhost:8094/state" -TimeoutSec 10
+            if ($other.dcsOpen -ne $false) { throw "gate opened for an unrelated code" }
+            Write-Host "requested 754: gate closed"
+          }
+          finally {
+            if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
+          }
+
+      - name: Upload DCS test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dcs-test-log
+          path: |
+            dcs-test.log
+            dcs-test.err
+          if-no-files-found: ignore
+
       # The icon is generated, not hand-edited. Rather than compare bytes —
       # GDI+ antialiasing differs between Windows versions, so a hash check
       # would fail for reasons outside anyone's control — parse the file and

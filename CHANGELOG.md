@@ -9,8 +9,37 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Planned
 - RSDN-20 and SAQ decoders
 - RDS clock time (group 4A), verified against a real transmitter
-- DCS (digital coded squelch) alongside CTCSS
 - Optional password and rate limiting for the web server
+
+## [0.12.0] - 2026-11-12
+
+### Added
+- **DCS decoding** — Golay (23,12) block code, word sync recovered from the data
+  itself, and both polarities (normal and inverted codes).
+- `Dcs` code utilities: octal parsing and formatting, plus `SameCode` which
+  compares by transmission rather than by number (see below).
+- `SyntheticRadioSource` now transmits DCS instead of CTCSS on request;
+  `web --sim-dcs` demonstrates it without hardware.
+- `dcs`, `dcsWanted`, `dcsInverted` and `dcsOpen` in `/state`; `dcs` parameter on
+  `/tune`; the radio badge in the UI shows the code.
+- DCS integration test in CI, including the negative case.
+
+### Notes on the cyclic ambiguity
+Golay (23,12) is a *cyclic* code, so every rotation of a code word is also a code
+word — and decodes to a *different* code. DCS has no framing, so a receiver
+cannot know which bit the word begins at, and the same transmission legitimately
+decodes to any of several codes depending on where the frame boundary falls.
+
+This is a property of the code, not a defect. It is handled the way it physically
+should be: `Dcs.SameCode` enumerates the alignments of the requested code and
+accepts any of them. A repeater transmitting 023 will open a receiver set to 023
+whatever alignment the receiver happens to lock onto.
+
+What is *not* verified: the mapping from the published octal code to the on-air
+bit pattern. The Golay layer is tested against the code's own properties
+(syndrome, three-bit correction, round trip); the code table is the commonly
+published list and the decoder reports whatever it decodes, so a code missing
+from the table still works. Verifying the mapping needs a physical radio.
 
 ## [0.11.0] - 2026-11-12
 

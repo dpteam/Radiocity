@@ -36,6 +36,12 @@ namespace Radiocity.App
         /// </summary>
         private static double? CtcssRequested;
 
+        /// <summary>
+        /// DCS code squelch. Null means off; 0 means "any code"; a number is the
+        /// 9-bit code. Set with -dcs (any) or -dcs023.
+        /// </summary>
+        private static int? DcsRequested;
+
         private static int Main(string[] args)
         {
             // A pool thread that throws takes the whole process down. Say why,
@@ -99,6 +105,12 @@ namespace Radiocity.App
                         CtcssRequested = Ctcss.Nearest(t);
                     else rest.Add(args[i]);
                 }
+                else if (a == "-dcs") DcsRequested = 0;
+                else if (a.StartsWith("-dcs") && a.Length > 4)
+                {
+                    try { DcsRequested = Dcs.Parse(a.Substring(4)); }
+                    catch (FormatException) { rest.Add(args[i]); }
+                }
                 else if (a.StartsWith("-nb") && a.Length > 3)
                 {
                     float t;
@@ -146,6 +158,8 @@ namespace Radiocity.App
             Console.WriteLine("  add -b24 (or -b8/-b16/-b32) to any command to pick the capture depth.");
             Console.WriteLine("  add -nb to enable the impulse noise blanker (-nb20 for a looser threshold).");
             Console.WriteLine("  add -stereo for FM stereo (needs --rate 192000 on 'web', or 128 kHz+ capture).");
+            Console.WriteLine("  add -ctcss for CTCSS tone squelch (-ctcss88.5 for a specific tone),");
+            Console.WriteLine("      or -dcs for DCS code squelch (-dcs023 for a specific code).");
             Console.WriteLine("  add --sim to 'web' to serve a synthetic band, no sound card needed.");
             Console.WriteLine();
             Console.WriteLine("  Reality check: a sound card ADC stops at its own sample rate, so it hears");
@@ -168,6 +182,8 @@ namespace Radiocity.App
             ok &= RunFmStereoTest();
             Console.WriteLine();
             ok &= RunNfmTest();
+            Console.WriteLine();
+            ok &= RunDcsTest();
             Console.WriteLine();
             ok &= RunRdsTest();
             Console.WriteLine();
@@ -956,6 +972,141 @@ namespace Radiocity.App
             return ok;
         }
 
+        private static bool RunDcsTest()
+        {
+            // DCS is a Golay-coded word repeating at 134.4 bps with no framing, so
+            // the interesting questions are: does the word code work, does the
+            // decoder find the 23-bit boundary from nothing, and does a wrong code
+            // actually keep the audio silent.
+            const double fs = 48000.0;
+            const double deviation = 2500.0;
+
+            int code = Dcs.Parse("023");
+
+            Console.WriteLine("DCS self-test");
+
+            // The code itself, with no radio in the way.
+            int word = Golay23.Encode(code);
+            int syndrome = Golay23.Syndrome(word);
+            int data;
+            int errors;
+
+            bool roundTrip = Golay23.TryDecode(word, out data, out errors) &&
+                             data == code && errors == 0;
+
+            // Three flipped bits is the documented limit; a fourth must not be
+            // silently accepted as a different valid code.
+            int damaged = word ^ 1 ^ (1 << 9) ^ (1 << 17);
+            int fixedData;
+            int fixedErrors;
+            bool repaired = Golay23.TryDecode(damaged, out fixedData, out fixedErrors) &&
+                            fixedData == code && fixedErrors == 3;
+
+            Console.WriteLine("  Golay(23,12): syndrome " + syndrome.ToString("X3", Inv) +
+                              ", round trip " + roundTrip + ", 3-bit damage repaired " + repaired);
+
+            bool codeOk = roundTrip && repaired && syndrome == 0;
+
+            // Normal code through a whole narrowband FM link.
+            float[] bi, bq;
+            BuildDcsSignal(code, false, fs, deviation, 6.0, out bi, out bq);
+
+            ReceiverOptions o = ReceiverOptions.Nfm(1);
+            o.AgcEnabled = false;
+            o.DcsCode = code;
+
+            Receiver rx = new Receiver(fs, 0.0, o);
+            float[] audio = RunComplex(rx, bi, bq);
+
+            int decoded = rx.Dcs != null ? rx.Dcs.Code : -1;
+            bool synced = rx.Dcs != null && rx.Dcs.Synced;
+            double rmsOpen = Rms(audio, audio.Length * 2 / 3, audio.Length / 3);
+
+            Console.WriteLine("  normal   : decoded " + Dcs.Format(decoded) +
+                              " (" + decoded + "), synced " + synced +
+                              ", words " + (rx.Dcs != null ? rx.Dcs.Words : 0) +
+                              ", audio rms " + rmsOpen.ToString("F3", Inv));
+
+            // The inverted variant: every bit flipped. Same code, different bits.
+            BuildDcsSignal(code, true, fs, deviation, 6.0, out bi, out bq);
+
+            ReceiverOptions oInv = ReceiverOptions.Nfm(1);
+            oInv.AgcEnabled = false;
+            oInv.DcsCode = code;
+
+            Receiver rxInv = new Receiver(fs, 0.0, oInv);
+            RunComplex(rxInv, bi, bq);
+
+            bool invSynced = rxInv.Dcs != null && rxInv.Dcs.Synced;
+            int invCode = rxInv.Dcs != null ? rxInv.Dcs.Code : -1;
+            bool invFlag = rxInv.Dcs != null && rxInv.Dcs.Inverted;
+
+            Console.WriteLine("  inverted : decoded " + Dcs.Format(invCode) +
+                              " (" + invCode + "), synced " + invSynced +
+                              ", inverted " + invFlag);
+
+            // The wrong code must close the gate, not merely soften the audio.
+            BuildDcsSignal(code, false, fs, deviation, 6.0, out bi, out bq);
+
+            ReceiverOptions oWrong = ReceiverOptions.Nfm(1);
+            oWrong.AgcEnabled = false;
+            oWrong.DcsCode = Dcs.Parse("754");
+
+            Receiver rxWrong = new Receiver(fs, 0.0, oWrong);
+            float[] wrongAudio = RunComplex(rxWrong, bi, bq);
+
+            double rmsWrong = Rms(wrongAudio, wrongAudio.Length * 2 / 3, wrongAudio.Length / 3);
+
+            Console.WriteLine("  wrong code: wanted 754, heard " + Dcs.Format(rxWrong.Dcs.Code) +
+                              ", audio rms " + rmsWrong.ToString("F5", Inv));
+
+            bool ok = codeOk &&
+                      Dcs.SameCode(decoded, code) && synced && rmsOpen > 0.05 &&
+                      Dcs.SameCode(invCode, code) && invSynced && invFlag &&
+                      rmsWrong < rmsOpen * 0.02;
+
+            Console.WriteLine(ok ? "  PASS" : "  FAIL: DCS path is wrong");
+            return ok;
+        }
+
+        /// <summary>Narrowband FM carrying a voice tone and a DCS code word.</summary>
+        private static void BuildDcsSignal(int code, bool inverted, double fs, double deviation,
+                                           double seconds, out float[] i, out float[] q)
+        {
+            int n = (int)(fs * seconds);
+            i = new float[n];
+            q = new float[n];
+
+            int[] bits = DcsEncoder.Bits(code, inverted);
+            double bitRate = DcsDecoder.BitRateHz;
+
+            double phase = 0.0;
+
+            for (int k = 0; k < n; k++)
+            {
+                double t = k / fs;
+
+                double voice = 0.5 * Math.Cos(2.0 * Math.PI * 900.0 * t);
+
+                // DCS sits at about 30% of the deviation on a real handheld.
+                long bitIndex = (long)(t * bitRate);
+                int bit = bits[(int)(bitIndex % bits.Length)];
+                double dcs = (bit == 1 ? 0.30 : -0.30);
+
+                i[k] = (float)Math.Cos(phase);
+                q[k] = (float)Math.Sin(phase);
+
+                phase += 2.0 * Math.PI * deviation * (voice + dcs) / fs;
+            }
+        }
+
+        private static double Rms(float[] buf, int offset, int count)
+        {
+            double sum = 0.0;
+            for (int k = 0; k < count; k++) sum += buf[offset + k] * (double)buf[offset + k];
+            return Math.Sqrt(sum / Math.Max(1, count));
+        }
+
         private static bool RunImbalanceTest()
         {
             // A real quadrature front end has two analogue paths that are never
@@ -1220,6 +1371,7 @@ namespace Radiocity.App
 
             o.BlankerThreshold = BlankerThreshold;
             o.CtcssTone = CtcssRequested;
+            o.DcsCode = DcsRequested;
             return o;
         }
 
@@ -1557,6 +1709,7 @@ namespace Radiocity.App
             bool simulatedQuadrature = false;
             bool simulatedFm = false;
             bool simulatedRadio = false;
+            bool simulatedDcs = false;
             bool correctImbalance = true;
             int port = 8080;
             int rate = 48000;
@@ -1573,6 +1726,7 @@ namespace Radiocity.App
                 else if (a == "--sim-iq") simulatedQuadrature = true;
                 else if (a == "--sim-fm") simulatedFm = true;
                 else if (a == "--sim-radio") simulatedRadio = true;
+                else if (a == "--sim-dcs") simulatedDcs = true;
                 else if (a == "--no-imbalance") correctImbalance = false;
                 else if (a == "--port" && i + 1 < args.Length) port = int.Parse(args[++i], Inv);
                 else if (a == "--rate" && i + 1 < args.Length) rate = int.Parse(args[++i], Inv);
@@ -1584,10 +1738,20 @@ namespace Radiocity.App
 
             ISampleSource source;
 
-            if (simulatedRadio)
+            if (simulatedRadio || simulatedDcs)
             {
-                // A handheld: narrowband FM, voice-like audio, 88.5 Hz CTCSS.
-                source = new SyntheticRadioSource(rate, 2500.0, 88.5);
+                // A handheld: narrowband FM, voice-like audio, and a squelch code.
+                if (simulatedDcs)
+                {
+                    int dcs = DcsRequested.HasValue && DcsRequested.Value > 0 ? DcsRequested.Value : Dcs.Parse("023");
+                    source = new SyntheticRadioSource(rate, 2500.0, 0.0, dcs);
+                    DcsRequested = dcs;
+                }
+                else
+                {
+                    source = new SyntheticRadioSource(rate, 2500.0, 88.5);
+                }
+
                 mode = DemodMode.Nfm;
                 freq = 0.0;
                 Console.WriteLine("source: " + source.Description + " (no hardware needed)");

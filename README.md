@@ -21,6 +21,7 @@ AM      : distortion 109.5 dB below tone      (below float32 resolution)
 FM      : residual    62.3 dB below tone
 FM st.  : 48 dB channel separation (1 kHz left, 3 kHz right)
 NFM     : 75 dB CTCSS rejection, tone detected to 0.1 Hz
+DCS     : Golay (23,12) exact, wrong code silences the receiver
 RDS     : 24 groups, 0 bad blocks, station name and text exact
 SSB     : sideband rejection -111.1 dB
 CW      : carrier -> 700 Hz beat note
@@ -106,7 +107,8 @@ a looser threshold). Both are off by default: on a clean signal a blanker can
 only do harm, and stereo needs a 192 kHz capture.
 
 For the radio mode, `-ctcss` opens the squelch for any CTCSS tone and
-`-ctcss88.5` only for that one.
+`-ctcss88.5` only for that one. `-dcs` does the same for any DCS code, and
+`-dcs023` only for that one.
 | `iq record <file> <freqHz> [sec]` | Record baseband I/Q for offline analysis |
 | `iq demod <file> <out.wav> [mode]` | Demodulate a recording — try any mode on the same capture |
 | `iq info <file>` | Show what a recording contains |
@@ -159,6 +161,7 @@ affordable on a 2005 CPU.
 | RDS | `src/Dsp/Rds.cs` | 57 kHz subcarrier, biphase + differential decode, CRC with offset words, station name and text |
 | NFM | `src/Dsp/Receiver.cs` | ±2.5 kHz deviation, 12.5 kHz channel, 300–3000 Hz speech band |
 | CTCSS | `src/Dsp/Ctcss.cs` | 50 EIA tones, 1 s Goertzel window, tone squelch with hysteresis |
+| DCS | `src/Dsp/Dcs.cs` | Golay (23,12), sync from the code itself, cyclic-alias comparison |
 | AGC | `src/Dsp/Demod.cs` | RMS detector, asymmetric *gain slew* (not an asymmetric detector) |
 | Squelch | `src/Dsp/Squelch.cs` | Hysteresis on channel power, measured before the AGC |
 | Blanker | `src/Dsp/NoiseBlanker.cs` | Impulse detection on the baseband, before the channel filter smears the click |
@@ -189,6 +192,7 @@ Full explanation in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | Imbalance | image from −31 dB to −80 dB | blind correction must not need a calibration signal |
 | FM stereo | > 30 dB channel separation | below that the stereo image collapses to mono |
 | NFM | CTCSS tone within 0.5 Hz, > 20 dB below voice | the tone must be found and must not be heard |
+| DCS | Golay round trip, 3-bit repair, wrong code silences | the code layer is exact; the radio path is not |
 | RDS | exact station name and text | it is digital; "roughly right" means broken |
 | Resampler | amplitude within 2%, > 30 dB | a bad interpolator is audible as dullness |
 | DCF77 | full frame at −40 and −20 dBFS | the second one is a noisy city, not a lab |
@@ -258,14 +262,14 @@ blanker, spectrum, offline demodulation, clock calibration, DCF77 decoding,
 8/16/24/32-bit capture, multi-stage decimation, I/Q recording, a **WebSDR front
 end**, **independent tuning for every listener**, a **quadrature front end path**
 with blind I/Q imbalance correction, **FM stereo**, **RDS**, and a
-**narrowband FM radio mode** with CTCSS tone squelch.
+**narrowband FM radio mode** with CTCSS and DCS tone squelch.
 
 Not yet:
 
 - [ ] RSDN-20 and SAQ decoders.
 - [ ] RDS clock time (group 4A). The layout is documented but not verified
       against a real transmitter, so it is left out rather than shipped wrong.
-- [ ] DCS, the digital successor to CTCSS.
+- [ ] Verifying the DCS octal-to-bits mapping against a physical radio.
 - [ ] Password and rate limiting on the web server. It is a receiver for a
       trusted network, not a public service.
 
@@ -447,7 +451,28 @@ ctcssWanted 88.5     <- what this receiver listens for
 ctcssOpen true       <- gate open
 ```
 
-With the wrong tone configured, the gate stays shut and the audio is silent —
+**DCS** is the digital successor: instead of a tone, a Golay-coded word repeats
+at 134.4 bps. `-dcs023` opens for that code, `-dcs` for any.
+
+```
+dcs 023              <- code decoded
+dcsWanted 023        <- what this receiver listens for
+dcsOpen true         <- gate open
+```
+
+The word is a Golay (23,12) code word — 12 data bits, 11 check bits, corrects
+three errors. There is no framing at all, so block sync has to come from the data
+itself, which is why the code carries so much redundancy.
+
+**One thing worth knowing.** Golay (23,12) is a *cyclic* code, so every rotation
+of a code word is also a valid code word, and decodes to a *different* code. A
+receiver cannot tell from the word alone which bit the frame starts at, so the
+same transmission legitimately decodes to any of several codes depending on
+where the boundary falls. That is a property of the code, not a defect. This
+implementation accepts any alignment of the code you asked for, so a repeater
+transmitting 023 opens a receiver set to 023 regardless.
+
+With the wrong code configured, the gate stays shut and the audio is silent —
 not quieter, silent. That is the assertion the CI test makes.
 
 Two things worth knowing before pointing this at real hardware:

@@ -466,14 +466,22 @@
       else { stereoBadge.className = "badge"; stereoBadge.textContent = "mono"; }
     }
 
-    // CTCSS: only meaningful in narrowband FM. Shows the tone that is present
-    // and whether the tone squelch is letting audio through.
+    // CTCSS / DCS: only meaningful in narrowband FM. Shows the code that is
+    // present and whether the tone squelch is letting audio through.
     var ctcssBadge = document.getElementById("ctcssBadge");
     if (ctcssBadge) {
       var tone = s.ctcss || 0;
       var wanted = s.ctcssWanted || 0;
+      var dcs = s.dcs || "";
+      var dcsWanted = s.dcsWanted || "";
 
-      if (tone > 0) {
+      if (dcs) {
+        ctcssBadge.className = s.dcsOpen === false ? "badge" : "badge on";
+        ctcssBadge.textContent = "dcs " + dcs + (s.dcsInverted ? "i" : "");
+      } else if (dcsWanted) {
+        ctcssBadge.className = "badge";
+        ctcssBadge.textContent = "want dcs " + dcsWanted;
+      } else if (tone > 0) {
         ctcssBadge.className = "badge on";
         ctcssBadge.textContent = "ctcss " + tone.toFixed(1) + " Hz";
       } else if (wanted > 0) {

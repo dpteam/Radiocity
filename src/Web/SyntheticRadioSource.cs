@@ -18,6 +18,8 @@ namespace Radiocity.Web
         private readonly int _rate;
         private readonly double _deviation;
         private readonly double _ctcssHz;
+        private readonly int? _dcsCode;
+        private readonly int[] _dcsBits;
         private readonly Random _rnd = new Random(909);
 
         private readonly object _lock = new object();
@@ -27,10 +29,17 @@ namespace Radiocity.Web
         private double _phase;
 
         public SyntheticRadioSource(int rate, double deviation, double ctcssHz)
+            : this(rate, deviation, ctcssHz, null)
+        {
+        }
+
+        public SyntheticRadioSource(int rate, double deviation, double ctcssHz, int? dcsCode)
         {
             _rate = rate;
             _deviation = deviation;
             _ctcssHz = ctcssHz;
+            _dcsCode = dcsCode;
+            _dcsBits = dcsCode.HasValue ? DcsEncoder.Bits(dcsCode.Value, false) : null;
         }
 
         public int SampleRate { get { return _rate; } }
@@ -40,9 +49,12 @@ namespace Radiocity.Web
         {
             get
             {
+                string squelch = _dcsCode.HasValue
+                    ? "DCS " + Radiocity.Dsp.Dcs.Format(_dcsCode.Value)
+                    : "CTCSS " + _ctcssHz.ToString("F1") + " Hz";
+
                 return "synthetic NFM handheld, " + _rate + " Hz, +-" +
-                       (_deviation / 1000.0).ToString("F1") + " kHz, CTCSS " +
-                       _ctcssHz.ToString("F1") + " Hz";
+                       (_deviation / 1000.0).ToString("F1") + " kHz, " + squelch;
             }
         }
 
@@ -90,9 +102,22 @@ namespace Radiocity.Web
                     double voice = 0.55 * syllable * Math.Cos(twoPi * 900.0 * t);
 
                     // CTCSS sits at 15% of full deviation: typical for a handheld.
-                    double ctcss = 0.15 * Math.Cos(twoPi * _ctcssHz * t);
+                    // DCS replaces it, at about 30%, and is a polar NRZ square
+                    // wave rather than a sine.
+                    double squelchTone;
 
-                    double modulation = voice + ctcss;
+                    if (_dcsBits != null)
+                    {
+                        long bitIndex = (long)(t * DcsDecoder.BitRateHz);
+                        int bit = _dcsBits[(int)(bitIndex % _dcsBits.Length)];
+                        squelchTone = (bit == 1) ? 0.30 : -0.30;
+                    }
+                    else
+                    {
+                        squelchTone = 0.15 * Math.Cos(twoPi * _ctcssHz * t);
+                    }
+
+                    double modulation = voice + squelchTone;
 
                     dstI[k] = (float)Math.Cos(phase);
                     dstQ[k] = (float)Math.Sin(phase);

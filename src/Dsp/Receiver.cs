@@ -81,6 +81,12 @@ namespace Radiocity.Dsp
         /// </summary>
         public double? CtcssTone;
 
+        /// <summary>
+        /// DCS code the receiver will listen for, as the 9-bit value (see
+        /// <see cref="Dcs.Parse"/>); 0 accepts any code, null disables DCS.
+        /// </summary>
+        public int? DcsCode;
+
         public ReceiverOptions()
         {
             Mode = DemodMode.Am;
@@ -203,8 +209,10 @@ namespace Radiocity.Dsp
         private readonly RealDecimator _bandPassLo;
         private readonly RealDecimator _bandPassHi;
         private readonly CtcssDecoder _ctcss;
+        private readonly DcsDecoder _dcs;
         private readonly float[] _narrowBuf;
         private readonly double? _ctcssExpected;
+        private readonly int? _dcsExpected;
         private float _ctcssGate = 1.0f;
         private float _ctcssGateAttack;
         private float _ctcssGateRelease;
@@ -225,6 +233,7 @@ namespace Radiocity.Dsp
             _mode = options.Mode;
             SampleRate = sampleRate;
             _ctcssExpected = options.CtcssTone;
+            _dcsExpected = options.DcsCode;
 
             // FM needs a much wider baseband than AM or SSB. A stereo broadcast
             // puts information up to 53 kHz into the composite, so the chain must
@@ -354,6 +363,7 @@ namespace Radiocity.Dsp
                         _bandPassHi = new RealDecimator(FirDesign.HighPass((hpPass + hpStop) * 0.5, hp, 8.6), 1);
 
                         _ctcss = new CtcssDecoder(baseRate);
+                        _dcs = new DcsDecoder(baseRate);
 
                         // 16 kHz -> 8 kHz. Half of what the card was told, and
                         // exactly the rate the card will accept.
@@ -412,7 +422,7 @@ namespace Radiocity.Dsp
 
             if (Channels == 0) Channels = 1;
 
-            if (_mode == DemodMode.Nfm && _ctcssExpected.HasValue)
+            if (_mode == DemodMode.Nfm && (_ctcssExpected.HasValue || _dcsExpected.HasValue))
             {
                 // 5 ms to open, 80 ms to close. Opening fast means the first
                 // syllable is not chopped; closing slowly means a fading carrier
@@ -467,6 +477,9 @@ namespace Radiocity.Dsp
 
         /// <summary>CTCSS detector, or null outside narrowband FM.</summary>
         public CtcssDecoder Ctcss { get { return _ctcss; } }
+
+        /// <summary>DCS decoder, or null outside narrowband FM.</summary>
+        public DcsDecoder Dcs { get { return _dcs; } }
 
         /// <summary>Safe to call from any thread; takes effect at the next block.</summary>
         public void SetTune(double hz)
@@ -544,16 +557,39 @@ namespace Radiocity.Dsp
         /// </summary>
         private void ShapeNfmAudio(int n)
         {
-            if (_ctcss != null) _ctcss.Process(_audio, n);
+            bool open = true;
+
+            if (_ctcss != null)
+            {
+                _ctcss.Process(_audio, n);
+
+                if (_ctcssExpected != null)
+                {
+                    open &= _ctcss.TonePresent &&
+                            (_ctcssExpected.Value <= 0.0 ||
+                             Math.Abs(_ctcss.ToneHz - _ctcssExpected.Value) < 0.5);
+                }
+            }
+
+            // DCS lives in the same sub-audible region as CTCSS, so it is tapped
+            // from the same point: before the 300 Hz high-pass that removes both
+            // from the speaker.
+            if (_dcs != null)
+            {
+                _dcs.Process(_audio, n);
+
+                if (_dcsExpected != null)
+                {
+                    open &= _dcs.Synced &&
+                            (_dcsExpected.Value <= 0 ||
+                             Radiocity.Dsp.Dcs.SameCode(_dcs.Code, _dcsExpected.Value));
+                }
+            }
 
             int a = _bandPassHi.Process(_audio, n, _narrowBuf);
             int b = _bandPassLo.Process(_narrowBuf, a, _audio);
 
-            if (_ctcssExpected == null) return;
-
-            bool open = _ctcss.TonePresent &&
-                        (_ctcssExpected.Value <= 0.0 ||
-                         Math.Abs(_ctcss.ToneHz - _ctcssExpected.Value) < 0.5);
+            if (_ctcssExpected == null && _dcsExpected == null) return;
 
             float target = open ? 1.0f : 0.0f;
 
