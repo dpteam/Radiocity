@@ -9,7 +9,41 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Planned
 - RSDN-20 and SAQ decoders
 - RDS clock time (group 4A), verified against a real transmitter
+- RDS timing recovery (Gardner detector on matched-filtered NRZ)
 - Optional password and rate limiting for the web server
+
+## [0.12.1] - 2026-11-12
+
+A CI failure that turned out to be three bugs, one of them in the timing loop.
+
+### Fixed
+- **RadioText rendered missing segments as NUL characters.** A transmitter sends
+  the text in sixteen four-character segments in rotation, and a segment is lost
+  whenever a block fails its check — so the received set is full of holes.
+  Rendering the holes produced `SYNTH????????????????`, which is what made the
+  CI log unreadable. The getter now returns the contiguous prefix that actually
+  arrived, and non-printable bytes become spaces.
+- **A group decoded at the wrong alignment could overwrite the station name.**
+  Every RDS group repeats the same PI, so a group with a different PI is noise
+  wearing a valid checksum. It is now discarded.
+- **A single failed block dropped sync.** With any clock offset that happens often
+  enough to dominate the error budget; two consecutive failures is a real
+  misalignment, one is a click.
+- `RadioTextComplete` now means the text arrived with no gaps, not that some
+  segment near the end of the buffer was seen.
+
+### Removed
+- The RDS timing-recovery loop. It never worked: an early-late gate, a
+  correlation hill-climb and a derivative correlator all made a clean signal
+  worse, because all three assume a sharper waveform than a band-limited biphase
+  symbol provides. The bit clock is now free-running, which is exact when the
+  clocks agree (227 groups, 0 bad blocks over 20 s at 0 ppm) and degrades to
+  partial text rather than garbage when they do not. The measured numbers and the
+  proper fix are in `docs/ARCHITECTURE.md`.
+
+### Changed
+- The RDS integration test polls until the full text arrives instead of sleeping
+  a fixed time, and asserts the exact string rather than a substring.
 
 ## [0.12.0] - 2026-11-12
 

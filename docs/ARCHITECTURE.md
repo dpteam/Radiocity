@@ -473,6 +473,46 @@ word is not balanced — some have twenty ones and three zeros — so the mean o
 repeating unbalanced word sits nowhere near the middle of its two levels, and
 slicing at the mean would read every bit as zero. (It did, the first time.)
 
+**Bit clock.** There is none, and that is a limitation rather than a design choice.
+
+A biphase symbol always has a transition at its midpoint, so the clock is in
+principle recoverable from the signal. Three attempts failed on the actual
+waveform, which has been through a 2.4 kHz low-pass:
+
+| Approach | Result |
+|---|---|
+| Early-late gate at ±0.15 bit | 11 bad blocks out of 307 on a clean signal |
+| Hill-climbing on correlation strength | random walk, worse |
+| Derivative correlation against the square wave | worse, both signs |
+
+All three are the textbook answers and all three assume a sharper waveform than
+a band-limited biphase symbol provides. What ships is a free-running bit counter,
+which is exact when the transmitter and the card agree and degrades when they do
+not. Measured over 20 s at 192 kHz:
+
+| Clock offset | Groups | Bad blocks | Text |
+|---|---|---|---|
+| 0 ppm | 227 | 0 | complete |
+| 20 ppm | 24 | 114 | partial, clean |
+| 100 ppm | 17 | 116 | partial, clean |
+
+So the decoder is exact for the synthetic source and for a transmitter whose
+clock matches, and it degrades to "partial text" rather than to garbage when it
+does not. The proper fix is a Gardner detector on a matched-filtered NRZ signal
+after converting biphase to NRZ with a recovered square wave — a real piece of
+work, and one that needs a physical transmitter to validate against.
+
+**Integrity.** Every group carries the same PI. A group whose PI differs from the
+locked one was decoded at the wrong alignment, which is easy to hit once the clock
+drifts; it is discarded rather than allowed to overwrite the station name. Text
+characters outside printable ASCII become spaces for the same reason: a wrong
+alignment should look like a gap, never like a broken receiver.
+
+**One bad block is not a lost lock.** The decoder tolerates a single failed block
+and only drops sync after two in a row. Dropping on the first failure costs a
+whole group plus the words needed to re-sync, and with any clock offset that
+happens often enough to dominate the error budget.
+
 ## Performance notes
 
 Everything in `Process()` is preallocated. The whole AM chain at 48 kHz runs in

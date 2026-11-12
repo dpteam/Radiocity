@@ -332,12 +332,17 @@ jobs:
             }
             if (-not $ok) { throw "RDS server did not open port 8096" }
 
-            # A full RDS cycle is 20 groups at 11.4 groups/s, so allow ~4 s.
+            # A full RDS cycle is 20 groups at ~11.4 groups/s, so a couple of
+            # seconds is enough when the clocks agree — but poll rather than sleep
+            # a fixed time, because the first cycle starts wherever the capture
+            # happened to begin.
             $state = $null
-            for ($i = 0; $i -lt 40; $i++) {
+            $expected = "RADIOCITY SOUND CARD SDR - SYNTHETIC FM DEMO"
+
+            for ($i = 0; $i -lt 60; $i++) {
               Start-Sleep -Milliseconds 500
               try { $state = Invoke-RestMethod "http://localhost:8096/state" -TimeoutSec 10 } catch { continue }
-              if ($state.rds -eq $true -and $state.ps -eq "RADIOCIT") { break }
+              if ($state.rt -eq $expected) { break }
             }
             if ($null -eq $state) { throw "GET /state never answered" }
 
@@ -349,7 +354,7 @@ jobs:
             if ($state.rds -ne $true) { throw "RDS never synchronised" }
             if ($state.pi -ne "CAFE") { throw "PI is $($state.pi), expected CAFE" }
             if ($state.ps -ne "RADIOCIT") { throw "PS is '$($state.ps)', expected 'RADIOCIT'" }
-            if ($state.rt -notlike "*SYNTHETIC FM DEMO*") { throw "RadioText is '$($state.rt)'" }
+            if ($state.rt -ne $expected) { throw "RadioText is '$($state.rt)', expected '$expected'" }
             if ($state.stereo -ne $true) { throw "station should decode as stereo" }
           }
           finally {

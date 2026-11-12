@@ -269,6 +269,8 @@ Not yet:
 - [ ] RSDN-20 and SAQ decoders.
 - [ ] RDS clock time (group 4A). The layout is documented but not verified
       against a real transmitter, so it is left out rather than shipped wrong.
+- [ ] RDS timing recovery. The bit clock is free-running today; see
+      [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for what was tried and why.
 - [ ] Verifying the DCS octal-to-bits mapping against a physical radio.
 - [ ] Password and rate limiting on the web server. It is a receiver for a
       trusted network, not a public service.
@@ -413,6 +415,18 @@ real damage, so three or more drops the block and the group parser waits.
 **Differential decoding** means a 180 degree phase error in the demodulator is
 harmless: what arrives is the XOR of consecutive bits, so inverting everything
 changes nothing.
+
+**The bit clock is free-running.** There is no timing recovery, and that is a
+known limitation rather than a choice: the textbook detectors all assume a
+sharper waveform than a band-limited biphase symbol provides, and all three
+attempts made a clean signal worse. With the clocks agreeing the decoder is exact
+(227 groups, 0 bad blocks over 20 s); with a 20 ppm offset it degrades to partial
+text rather than to garbage. The measurements and the proper fix are in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+**Integrity comes from the PI.** Every group repeats the same programme
+identifier, so a group that decodes with a different one was read at the wrong
+alignment and is discarded instead of overwriting the station name.
 
 The web UI shows the station name and text in a panel under the waterfall, and
 `/state` exposes `pi`, `ps`, `rt`, `pty`, `groups` and `rds`.

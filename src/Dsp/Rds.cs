@@ -161,17 +161,17 @@ namespace Radiocity.Dsp
 
         private double _bitPhase;
         private double _bitInc;
-        private double _phaseOffset;
-        private double _freqCorr;
+
+        /// <summary>Tracking gain per bit, once the offset has been found.</summary>
+
         private float _accMain;
-        private float _accEarly;
-        private float _accLate;
 
         private int _reg;
         private int _bitsInBlock;
         private bool _synced;
         private int _expectedOffset;
         private int _blocksInGroup;
+        private int _failStreak;
         private readonly int[] _groupWords = new int[4];
 
         private readonly int[] _psChars = new int[8];
@@ -188,13 +188,23 @@ namespace Radiocity.Dsp
         /// <summary>Programme service name, 8 characters. Empty until complete.</summary>
         public string ProgramService { get; private set; }
 
-        /// <summary>RadioText, up to 64 characters. Empty until the first segment.</summary>
+        /// <summary>
+        /// RadioText, up to 64 characters.
+        ///
+        /// Only the contiguous prefix that has actually arrived is returned. A
+        /// transmitter sends the text in sixteen four-character segments in
+        /// rotation, and a segment can be missed when a block fails its check —
+        /// so the received set is full of holes. Rendering those holes as NUL
+        /// characters produces the kind of output that makes a bug report say
+        /// "SYNTH????????????????", which helps nobody. Stopping at the first
+        /// gap is honest: what you see is what arrived, in order.
+        /// </summary>
         public string RadioText
         {
             get
             {
                 int len = 0;
-                for (int i = 0; i < _rtChars.Length; i++) if (_rtSeen[i]) len = i + 1;
+                while (len < _rtChars.Length && _rtSeen[len]) len++;
                 if (len == 0) return string.Empty;
 
                 // 0x0D marks end-of-text; anything after it is padding the
@@ -205,6 +215,30 @@ namespace Radiocity.Dsp
                 while (len > 0 && _rtChars[len - 1] == ' ') len--;
 
                 return new string(_rtChars, 0, len);
+            }
+        }
+
+        /// <summary>
+        /// True when the text has arrived in full, so <see cref="RadioText"/> is
+        /// complete rather than merely the part that survived.
+        ///
+        /// "In full" means either the end-of-text marker was reached with no gaps
+        /// before it, or all 64 characters arrived. A stray segment near the end
+        /// of the buffer is not enough: with a drifting clock the decoder can lock
+        /// onto the wrong alignment and fill the tail with noise, and reporting
+        /// that as complete would make a caller act on rubbish.
+        /// </summary>
+        public bool RadioTextComplete
+        {
+            get
+            {
+                for (int i = 0; i < _rtChars.Length; i++)
+                {
+                    if (!_rtSeen[i]) return false;
+                    if (_rtChars[i] == '\r') return true;
+                }
+
+                return true;
             }
         }
 
@@ -346,40 +380,20 @@ namespace Radiocity.Dsp
         {
             for (int k = 0; k < n; k++)
             {
-                // The reference position is the bit phase plus whatever timing
-                // correction the loop has accumulated. The decimation filters
-                // delay the signal by more than a whole bit, so the loop has to
-                // be able to shift the phase, not just trim the frequency.
-                double p = Wrap(_bitPhase + _phaseOffset);
+                double p = Wrap(_bitPhase);
                 float v = x[k];
 
                 // Biphase: within one bit the reference is +1 then -1. Correlating
                 // against that reference turns the transition itself into the bit.
                 _accMain += v * ((p < 0.5) ? 1.0f : -1.0f);
-                _accEarly += v * ((Wrap(p - 0.15) < 0.5) ? 1.0f : -1.0f);
-                _accLate += v * ((Wrap(p + 0.15) < 0.5) ? 1.0f : -1.0f);
 
-                _bitPhase += _bitInc * (1.0 + _freqCorr);
+                _bitPhase += _bitInc;
 
                 if (_bitPhase >= 1.0)
                 {
                     _bitPhase -= 1.0;
                     EmitBit(_accMain > 0.0f);
-
-                    // Early-late timing. If the late reference correlates more
-                    // strongly, our clock is behind the signal's, so the phase
-                    // has to move forward.
-                    float mag = Math.Abs(_accMain) + 1e-9f;
-                    double err = (Math.Abs(_accLate) - Math.Abs(_accEarly)) / mag;
-
-                    _phaseOffset = Wrap(_phaseOffset + 0.08 * err);
-                    _freqCorr += 0.0005 * (err - _freqCorr);
-                    if (_freqCorr > 0.05) _freqCorr = 0.05;
-                    if (_freqCorr < -0.05) _freqCorr = -0.05;
-
                     _accMain = 0.0f;
-                    _accEarly = 0.0f;
-                    _accLate = 0.0f;
                 }
             }
         }
@@ -411,6 +425,7 @@ namespace Radiocity.Dsp
                 if (RdsCode.Syndrome(_reg) == RdsCode.OffsetA)
                 {
                     _synced = true;
+                    _failStreak = 0;
                     _bitsInBlock = 0;
                     _blocksInGroup = 0;
                     _expectedOffset = RdsCode.OffsetB;
@@ -427,13 +442,24 @@ namespace Radiocity.Dsp
 
             if (RdsCode.TryCorrect(_reg, _expectedOffset, out corrected, out errors))
             {
+                _failStreak = 0;
                 CorrectedBits += errors;
                 AcceptBlock(corrected, errors);
+                return;
             }
-            else
+
+            BadBlocks++;
+
+            // One bad block is not proof that the alignment is wrong: a burst of
+            // noise, a click, a moment of multipath. Dropping sync on the first
+            // failure costs a whole group plus the three words needed to re-sync,
+            // and with a transmitter whose clock is even slightly off that happens
+            // often enough to dominate the error budget. Two consecutive failures
+            // is a real misalignment.
+            if (++_failStreak >= 2)
             {
-                BadBlocks++;
                 _synced = false;
+                _failStreak = 0;
                 _blocksInGroup = 0;
             }
         }
@@ -480,6 +506,18 @@ namespace Radiocity.Dsp
             g.C = _groupWords[2];
             g.D = _groupWords[3];
 
+            // Every RDS group carries the same programme identifier. A group whose
+            // PI differs from the one we are locked to was decoded at the wrong
+            // alignment — a valid syndrome is easy to hit when the clock has
+            // drifted — and its payload is noise. Rejecting it costs nothing and
+            // is the difference between a receiver that shows a short station name
+            // and one that shows "RA??OCITY SOUND CARDER??".
+            if (PiCode != 0 && g.Pi != PiCode)
+            {
+                BadBlocks++;
+                return;
+            }
+
             Groups++;
 
             if (g.Pi != 0) PiCode = g.Pi;
@@ -502,8 +540,8 @@ namespace Radiocity.Dsp
             int a = (g.D >> 8) & 0xFF;
             int b = g.D & 0xFF;
 
-            _psChars[seg * 2] = a;
-            _psChars[seg * 2 + 1] = b;
+            _psChars[seg * 2] = Printable((char)a);
+            _psChars[seg * 2 + 1] = Printable((char)b);
             _psSeen[seg * 2] = true;
             _psSeen[seg * 2 + 1] = true;
 
@@ -521,15 +559,29 @@ namespace Radiocity.Dsp
             int start = (g.Segment & 0x0F) * 4;
             if (start + 4 > _rtChars.Length) return;
 
-            _rtChars[start] = (char)((g.C >> 8) & 0xFF);
-            _rtChars[start + 1] = (char)(g.C & 0xFF);
-            _rtChars[start + 2] = (char)((g.D >> 8) & 0xFF);
-            _rtChars[start + 3] = (char)(g.D & 0xFF);
+            _rtChars[start] = Printable((char)((g.C >> 8) & 0xFF));
+            _rtChars[start + 1] = Printable((char)(g.C & 0xFF));
+            _rtChars[start + 2] = Printable((char)((g.D >> 8) & 0xFF));
+            _rtChars[start + 3] = Printable((char)(g.D & 0xFF));
 
             _rtSeen[start] = true;
             _rtSeen[start + 1] = true;
             _rtSeen[start + 2] = true;
             _rtSeen[start + 3] = true;
+        }
+
+        /// <summary>
+        /// Keeps the display to characters that can be displayed.
+        ///
+        /// RDS defines its own character set, but a group decoded at the wrong
+        /// alignment produces bytes that are not in it — and a terminal, a JSON
+        /// response and a PowerShell string all handle control characters badly.
+        /// Anything outside printable ASCII becomes a space, which at worst looks
+        /// like a gap and never like a broken receiver.
+        /// </summary>
+        private static char Printable(char c)
+        {
+            return (c >= 0x20 && c < 0x7F) ? c : ' ';
         }
 
         public void Reset()
@@ -541,17 +593,14 @@ namespace Radiocity.Dsp
             _pilotPhase = 0.0;
 
             _bitPhase = 0.0;
-            _phaseOffset = 0.0;
-            _freqCorr = 0.0;
             _accMain = 0.0f;
-            _accEarly = 0.0f;
-            _accLate = 0.0f;
 
             _reg = 0;
             _bitsInBlock = 0;
             _synced = false;
             _expectedOffset = RdsCode.OffsetA;
             _blocksInGroup = 0;
+            _failStreak = 0;
             _prevEncoded = -1;
 
             Array.Clear(_psSeen, 0, _psSeen.Length);
